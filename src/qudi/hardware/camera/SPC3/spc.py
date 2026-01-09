@@ -798,7 +798,10 @@ class SPC3(object):
         self._checkError(ec)
 
         # if required, cast the buffer pointer from uint8_t* to uint16_t*
-        assert self._data_bits == DataDepth.value
+        # Update _data_bits if SDK returns different depth than configured
+        if self._data_bits != DataDepth.value:
+            self._data_bits = DataDepth.value
+
         if DataDepth.value == 16:
             buf = cast(buf, POINTER(c_uint16))
             count = size // 2
@@ -1684,6 +1687,20 @@ class SPC3(object):
 
         num_pixels = header.N_pix
         num_counters = header.N_counters
+
+        # Debug: log what we read from file
+        print(f"ReadSPC3DataFile DEBUG:")
+        print(
+            f"  Header: N_rows={header.N_rows}, N_cols={header.N_cols}, N_frames={header.N_frames}, N_counters={header.N_counters}"
+        )
+        print(f"  Header: N_pix={header.N_pix}, bit_x_pix={header.bit_x_pix}")
+        print(f"  Calculated data_count={data_count}, dtype={dtype}")
+        print(f"  Read data.size={data.size}, data.dtype={data.dtype}")
+        print(f"  Using num_pixels={num_pixels}, num_counters={num_counters}")
+        print(
+            f"  Check: data.size % (num_pixels * num_counters) = {data.size % (num_pixels * num_counters)}"
+        )
+
         frames = SPC3.BufferToFrames(data, num_pixels, num_counters)
 
         return frames, header

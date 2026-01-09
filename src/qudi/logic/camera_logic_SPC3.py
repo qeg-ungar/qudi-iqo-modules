@@ -34,6 +34,14 @@ from qudi.core.module import LogicBase
 class CameraLogic(LogicBase):
     """Logic class for controlling a camera.
 
+    Unit Convention:
+    - ALL TIME VALUES IN SECONDS throughout (exposure, integration)
+    - Binning (NIntegFrames): Integer count (no units)
+    - Hardware internally uses CLOCK CYCLES where each cycle = 10ns
+
+    The hardware module handles all conversion: SECONDS → NANOSECONDS → CLOCK CYCLES
+    CRITICAL: Hardware integration parameter uses CLOCK CYCLES (10ns each), not nanoseconds or seconds
+
     Example config for copy-paste:
 
     camera_logic:
@@ -87,7 +95,10 @@ class CameraLogic(LogicBase):
         return self._last_frame
 
     def set_exposure(self, time):
-        """Set exposure time of camera"""
+        """Set exposure time of camera in SECONDS
+
+        @param float time: Exposure time in seconds
+        """
         with self._thread_lock:
             if self.module_state() == "idle":
                 camera = self._camera()
@@ -99,10 +110,62 @@ class CameraLogic(LogicBase):
                 )
 
     def get_exposure(self):
-        """Get exposure of hardware"""
+        """Get exposure of hardware in SECONDS
+
+        @return float: Exposure time in seconds
+        """
         with self._thread_lock:
             self._exposure = self._camera().get_exposure()
             return self._exposure
+
+    def get_display_units(self):
+        """Get the display units setting
+
+        @return str: 'counts' or 'cps'
+        """
+        with self._thread_lock:
+            return self._camera().get_display_units()
+
+    def set_display_units(self, units):
+        """Set the display units
+
+        @param str units: 'counts' or 'cps'
+        @return bool: Success?
+        """
+        with self._thread_lock:
+            if self.module_state() == "idle":
+                return self._camera().set_display_units(units)
+            else:
+                self.log.warning("Cannot change display units during acquisition")
+                return False
+
+    def set_snap_frames(self, num_frames):
+        """Set the number of frames for snap acquisition
+
+        @param int num_frames: Number of frames (1-65534)
+        @return bool: Success?
+        """
+        with self._thread_lock:
+            if self.module_state() == "idle":
+                camera = self._camera()
+                if hasattr(camera, "_NFrames"):
+                    camera._NFrames = max(1, min(num_frames, 65534))
+                    # Apply the change to camera hardware
+                    try:
+                        camera._apply_camera_settings()
+                        self.log.info(f"Snap frames set to {camera._NFrames}")
+                        return True
+                    except Exception as e:
+                        self.log.error(f"Failed to apply snap frames setting: {e}")
+                        return False
+                else:
+                    self.log.warning(
+                        "Camera does not support snap frames configuration"
+                    )
+                    return False
+            else:
+                self.log.warning("Cannot change snap frames during acquisition")
+                return False
 
     def set_gain(self, gain):
         with self._thread_lock:
@@ -166,6 +229,38 @@ class CameraLogic(LogicBase):
                 self.module_state.unlock()
                 self.sigAcquisitionFinished.emit()
 
+    def start_single_acquisition(self):
+        """Perform snap acquisition and return frames array
+
+        @return numpy array: Acquired frames, or None if failed
+        """
+        with self._thread_lock:
+            if self.module_state() != "idle":
+                self.log.error("Cannot snap: module not idle")
+                return None
+
+            camera = self._camera()
+            if camera is None:
+                self.log.error("No camera hardware connected")
+                return None
+
+            return camera.start_single_acquisition()
+
+    def save_frames_to_file(self, frames, filepath):
+        """Save frames array to .spc3 file
+
+        @param numpy array frames: Frames array
+        @param str filepath: Full path where to save
+        @return bool: Success?
+        """
+        with self._thread_lock:
+            camera = self._camera()
+            if camera is None:
+                self.log.error("No camera hardware connected")
+                return False
+
+            return camera.save_frames_to_file(frames, filepath)
+
     def toggle_continuous_acquisition(self, start, settings):
         if start:
             self._start_continuous_acquisition(
@@ -199,17 +294,84 @@ class CameraLogic(LogicBase):
                 self.module_state.unlock()
                 self.sigAcquisitionFinished.emit()
 
+    def capture_background_image(self):
+        """Capture background image for background subtraction"""
+        with self._thread_lock:
+            if self.module_state() == "idle":
+                camera = self._camera()
+                try:
+                    result = camera.capture_background_image()
+                    if not result:
+                        self.log.warning("Failed to capture background image")
+                    return result
+                except AttributeError:
+                    self.log.error("capture_background_image method not implemented")
+                    return False
+                except Exception as e:
+                    self.log.error(f"Error capturing background image: {e}")
+                    return False
+            else:
+                self.log.error(
+                    "Unable to capture background. Acquisition still in progress."
+                )
+                return False
+
+    def enable_background_subtraction(self):
+        """Enable background subtraction using captured background
+
+        Can be toggled during live acquisition since it's software-based.
+        """
+        with self._thread_lock:
+            camera = self._camera()
+            try:
+                result = camera.enable_background_subtraction()
+                if not result:
+                    self.log.warning("Failed to enable background subtraction")
+                return result
+            except AttributeError:
+                self.log.error("enable_background_subtraction method not implemented")
+                return False
+            except Exception as e:
+                self.log.error(f"Error enabling background subtraction: {e}")
+                return False
+
+    def disable_background_subtraction(self):
+        """Disable background subtraction
+
+        Can be toggled during live acquisition since it's software-based.
+        """
+        with self._thread_lock:
+            camera = self._camera()
+            try:
+                result = camera.disable_background_subtraction()
+                if not result:
+                    self.log.warning("Failed to disable background subtraction")
+                return result
+            except AttributeError:
+                self.log.error("disable_background_subtraction method not implemented")
+                return False
+            except Exception as e:
+                self.log.error(f"Error disabling background subtraction: {e}")
+                return False
+
     def toggle_background_subtraction(self, start):
+        """Toggle software background subtraction (if available)
+
+        Software-based subtraction is applied to each frame without requiring video restart.
+        """
+        camera = self._camera()
+        # Check if background subtraction methods are available
+        if not (
+            hasattr(camera, "enable_background_subtraction")
+            and callable(getattr(camera, "enable_background_subtraction", None))
+        ):
+            self.log.warning("Background subtraction not available for this camera")
+            return
+
         if start:
-            self._start_background_subtraction()
+            self.enable_background_subtraction()
         else:
-            self._stop_background_subtraction()
-
-    def _start_background_subtraction(self):
-        self._camera().background_subtraction()
-
-    def _stop_background_subtraction(self):
-        self._camera().stop_background_subtraction()
+            self.disable_background_subtraction()
 
     def __acquire_video_frame(self):
         """Execute step in the data recording loop: save one of each control and process values"""
@@ -229,8 +391,9 @@ class CameraLogic(LogicBase):
             camera = self._camera()
             self.total_bytes = self.total_bytes + camera.get_continuous_memory()
             if self.module_state() == "locked":
-                self.__timer_continuous.start(1) # wait 1 ms before clearing camera memory
-
+                self.__timer_continuous.start(
+                    1
+                )  # wait 1 ms before clearing camera memory
 
     def create_tag(self, time_stamp):
         return f"{time_stamp}_captured_frame"
@@ -251,20 +414,131 @@ class CameraLogic(LogicBase):
         cbar.ax.tick_params(which="both", length=0)
         return fig
 
-    def set_integration(self, integration_ns):
+    def set_integration(self, integration_seconds):
+        """Set hardware integration time in SECONDS
+
+        Hardware internally converts to CLOCK CYCLES (10ns each) via spc.SetCameraPar().
+
+        @param float integration_seconds: Hardware integration time in seconds
+        Note: In Normal mode (10.4 µs fixed), this parameter is ignored
+
+        CONVERSION: seconds × 1e9 ns/s ÷ 10 ns/cycle = clock_cycles
+        """
         with self._thread_lock:
             if self.module_state() == "idle":
                 camera = self._camera()
-                camera.set_hardware_integration(integration_ns)
+                try:
+                    result = camera.set_hardware_integration(integration_seconds)
+                    if result:
+                        self.log.info(
+                            f"Hardware integration set to {integration_seconds*1e6:.2f} µs"
+                        )
+                    else:
+                        self.log.warning(
+                            "Failed to set hardware integration (may be in Normal mode)"
+                        )
+                except AttributeError:
+                    self.log.error("set_hardware_integration method not implemented")
+                except Exception as e:
+                    self.log.error(f"Error setting hardware integration: {e}")
             else:
                 self.log.error(
                     "Unable to set hardware integration time. Acquisition still in progress."
                 )
 
     def set_binning(self, binning):
+        """Set temporal binning (NIntegFrames) - INTEGER frame count
+
+        Higher binning increases exposure time proportionally.
+        Exposure in seconds = binning × HardwareIntegration × 10ns
+
+        @param int binning: Number of frames to integrate (1-65534)
+        """
         with self._thread_lock:
             if self.module_state() == "idle":
                 camera = self._camera()
-                camera.set_binning(binning)
+                try:
+                    camera.set_binning(binning)
+                    # Update exposure time from hardware
+                    self._exposure = camera.get_exposure()
+                    self.log.info(
+                        f"Binning set to {binning} frames, exposure = {self._exposure*1e3:.2f} ms"
+                    )
+                except Exception as e:
+                    self.log.error(f"Error setting binning: {e}")
             else:
                 self.log.error("Unable to set binning. Acquisition still in progress.")
+
+    def load_acquisition_file(self, filepath):
+        """Load a .spc3 acquisition file for viewing
+
+        Works for both snap and continuous acquisitions.
+
+        @param str filepath: Path to the .spc3 file to load
+        @return bool: True if load successful, False otherwise
+        """
+        with self._thread_lock:
+            camera = self._camera()
+            try:
+                result = camera.load_acquisition_file(filepath)
+                if result:
+                    self.log.info(f"Loaded acquisition file: {filepath}")
+                else:
+                    self.log.warning(f"Failed to load file: {filepath}")
+                return result
+            except Exception as e:
+                self.log.error(f"Error loading continuous acquisition file: {e}")
+                return False
+
+    def get_loaded_frame_count(self):
+        """Get the number of frames in the loaded continuous acquisition file
+
+        @return int: Number of frames, or 0 if no file loaded
+        """
+        with self._thread_lock:
+            camera = self._camera()
+            try:
+                return camera.get_loaded_frame_count()
+            except Exception as e:
+                self.log.error(f"Error getting frame count: {e}")
+                return 0
+
+    def get_loaded_frame(self, frame_index):
+        """Get a specific frame from the loaded continuous acquisition file
+
+        @param int frame_index: Index of frame to retrieve (0-based)
+        @return numpy.ndarray: Frame data (rows, cols), or None if error
+        """
+        with self._thread_lock:
+            camera = self._camera()
+            try:
+                return camera.get_loaded_frame(frame_index)
+            except Exception as e:
+                self.log.error(f"Error getting frame {frame_index}: {e}")
+                return None
+
+    def get_current_frame_index(self):
+        """Get the current frame index in the loaded file
+
+        @return int: Current frame index, or -1 if no file loaded
+        """
+        with self._thread_lock:
+            camera = self._camera()
+            try:
+                return camera.get_current_frame_index()
+            except Exception as e:
+                self.log.error(f"Error getting current frame index: {e}")
+                return -1
+
+    def get_loaded_filepath(self):
+        """Get the path of the currently loaded file
+
+        @return str: File path, or None if no file loaded
+        """
+        with self._thread_lock:
+            camera = self._camera()
+            try:
+                return camera.get_loaded_filepath()
+            except Exception as e:
+                self.log.error(f"Error getting loaded filepath: {e}")
+                return None
