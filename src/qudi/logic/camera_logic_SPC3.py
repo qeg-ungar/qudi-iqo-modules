@@ -481,9 +481,7 @@ class CameraLogic(LogicBase):
             camera = self._camera()
             try:
                 result = camera.load_acquisition_file(filepath)
-                if result:
-                    self.log.info(f"Loaded acquisition file: {filepath}")
-                else:
+                if not result:
                     self.log.warning(f"Failed to load file: {filepath}")
                 return result
             except Exception as e:
@@ -542,3 +540,17 @@ class CameraLogic(LogicBase):
             except Exception as e:
                 self.log.error(f"Error getting loaded filepath: {e}")
                 return None
+
+    def load_frames_from_memory(self, frames):
+        """Load frames directly from memory for viewing
+
+        @param numpy.ndarray frames: Frames array to load
+        @return bool: Success?
+        """
+        with self._thread_lock:
+            camera = self._camera()
+            try:
+                return camera.load_frames_from_memory(frames)
+            except Exception as e:
+                self.log.error(f"Error loading frames from memory: {e}")
+                return False

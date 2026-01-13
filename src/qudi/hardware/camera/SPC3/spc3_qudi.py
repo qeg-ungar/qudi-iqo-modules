@@ -27,12 +27,13 @@ If not, see <https://www.gnu.org/licenses/>.
 
 from enum import Enum
 from ctypes import *
+from ctypes import c_uint32, c_uint16
 import numpy as np
 
 from qudi.core.configoption import ConfigOption
 from qudi.interface.camera_interface import CameraInterface
 
-from qudi.hardware.camera.SPC3.spc import SPC3
+from qudi.hardware.camera.SPC3.spc import SPC3, SPC3_H, SPC3Return
 
 
 class SPC3_Qudi(CameraInterface):
@@ -267,8 +268,8 @@ class SPC3_Qudi(CameraInterface):
     def start_single_acquisition(self):
         """Perform snap acquisition using proper SDK sequence
 
-        Executes: SnapPrepare → SnapAcquire → SnapGetImageBuffer
-        Returns frames array.
+        Executes: SnapPrepare → SnapAcquire → Extract frames using SnapGetImgPosition
+        Returns frames array built from SDK's internal buffer (same source as SaveImgDisk).
 
         @return numpy array: Acquired frames, or None if failed
         """
@@ -284,16 +285,57 @@ class SPC3_Qudi(CameraInterface):
             # Step 2: Trigger acquisition (blocks until complete)
             self.spc3.SnapAcquire()
 
-            # Step 3: Retrieve frames from buffer
-            frames = self.spc3.SnapGetImageBuffer()
+            # Step 3: Extract frames from SDK internal buffer by calling SDK directly
+            # This uses the SAME internal buffer that SaveImgDisk uses, ensuring consistent data
+            # We bypass spc.py's buggy SnapGetImgPosition wrapper and call the SDK directly
+            num_frames = self._NFrames
+            num_counters = self._NCounters
+
+            # Determine correct dtype based on bit depth
+            data_bits = self.spc3._data_bits
+            if data_bits == 16:
+                dtype = np.uint16
+            else:
+                dtype = np.uint8
+
+            # Setup SDK function call
+            f = self.spc3.dll.SPC3_Get_Img_Position
+            f.argtypes = [
+                SPC3_H,
+                np.ctypeslib.ndpointer(dtype=dtype, ndim=1, flags="C_CONTIGUOUS"),
+                c_uint32,
+                c_uint16,
+            ]
+            f.restype = SPC3Return
+
+            # Extract frames
+            frames_list = []
+            for counter_idx in range(1, num_counters + 1):  # SDK uses 1-based indexing
+                counter_frames = []
+                for frame_idx in range(1, num_frames + 1):  # SDK uses 1-based indexing
+                    # Allocate buffer for single frame
+                    data = np.zeros(
+                        self.spc3.row_size * self.spc3._num_rows, dtype=dtype
+                    )
+
+                    # Call SDK to get frame
+                    ec = f(self.spc3.c_handle, data, frame_idx, counter_idx)
+                    self.spc3._checkError(ec)
+
+                    # Transform using BufferToFrames
+                    frame = self.spc3.BufferToFrames(data, self.spc3._num_pixels, 1)
+                    # Remove counter and frame dimensions to get (cols, rows)
+                    frame = frame[0, 0, :, :]
+                    counter_frames.append(frame)
+                frames_list.append(counter_frames)
+
+            # Stack into final array: (counters, frames, cols, rows)
+            frames = np.array(frames_list)
 
             self._acquiring = False
-
-            if frames is None:
-                self.log.error("SnapGetImageBuffer returned None")
-                return None
-
+            self.log.info(f"Snap acquisition complete: shape={frames.shape}, dtype={frames.dtype}")
             return frames
+
         except Exception as e:
             self._acquiring = False
             self.log.error(f"Snap acquisition failed: {e}")
@@ -728,7 +770,7 @@ class SPC3_Qudi(CameraInterface):
         Uses SDK's SaveImgDisk to write directly from internal buffer.
         SDK may add .spc3 extension automatically.
 
-        @param numpy array frames: Frames array (for shape info only)
+        @param numpy array frames: Frames array (to get actual frame count)
         @param str filepath: Path to save file
         @return bool: Success?
         """
@@ -748,24 +790,21 @@ class SPC3_Qudi(CameraInterface):
                 os.makedirs(directory, exist_ok=True)
                 self.log.info(f"Created directory: {directory}")
 
-            # Save using SDK (expects path WITHOUT extension)
-            num_frames = self._NFrames
-            self.log.info(
-                f"Calling SaveImgDisk for frames 1-{num_frames} to '{filepath}'"
-            )
+            # Get actual number of frames from the frames array
+            # Shape is (num_counters, num_frames, rows, cols)
+            actual_num_frames = frames.shape[1]
+
+            self.log.info(f"Saving {actual_num_frames} frames to '{filepath}'")
 
             # SaveImgDisk(Start_Img, End_Img, filename, mode)
+            # Note: SDK uses 1-based indexing, so 1 to actual_num_frames saves all frames
             self.spc3.SaveImgDisk(
-                1, num_frames, filepath, SPC3.OutFileFormat.SPC3_FILEFORMAT
+                1, actual_num_frames, filepath, SPC3.OutFileFormat.SPC3_FILEFORMAT
             )
 
             # SDK adds .spc3 extension automatically
             expected_file = filepath + ".spc3"
             if os.path.exists(expected_file):
-                file_size = os.path.getsize(expected_file)
-                self.log.info(
-                    f"Successfully saved to {expected_file} ({file_size} bytes)"
-                )
                 return True
             else:
                 self.log.error(
@@ -861,7 +900,7 @@ class SPC3_Qudi(CameraInterface):
             return None
 
         # Extract counter 0, frame at index
-        # Shape: (num_counters=1, num_frames, rows, cols)
+        # Shape: (num_counters, num_frames, rows, cols) after BufferToFrames
         frame = self._loaded_frames[0, frame_index, :, :]  # Returns (rows, cols)
         self._current_frame_index = frame_index
         return frame
@@ -883,3 +922,27 @@ class SPC3_Qudi(CameraInterface):
         if hasattr(self, "_loaded_filepath"):
             return self._loaded_filepath
         return None
+
+    def load_frames_from_memory(self, frames):
+        """Load frames directly from memory for viewing
+
+        @param numpy.ndarray frames: Frames array to load (counters, frames, rows, cols)
+        @return bool: Success?
+        """
+        try:
+            self._loaded_frames = frames
+            self._loaded_header = {}  # No header for memory frames
+            self._current_frame_index = 0
+            self._loaded_filepath = "(unsaved snap acquisition)"
+
+            num_counters, num_frames, rows, cols = frames.shape
+            self.log.info(
+                f"Loaded {num_frames} frames ({rows}×{cols}) from memory (counters: {num_counters})"
+            )
+            return True
+        except Exception as e:
+            self.log.error(f"Failed to load frames from memory: {e}")
+            import traceback
+
+            self.log.error(f"Traceback: {traceback.format_exc()}")
+            return False
