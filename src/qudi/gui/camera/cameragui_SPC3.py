@@ -352,6 +352,7 @@ class CameraGui(GuiBase):
         self._continuous_acq_dialog = None
         self._continuous_acq_settings = None
         self._viewer_dialog = None
+        self._snap_frames = None  # Store in-memory snap frames
 
     def on_activate(self):
         """Initializes all needed UI files and establishes the connectors."""
@@ -725,9 +726,67 @@ class CameraGui(GuiBase):
             # Update the main image display with the selected frame
             self._mw.image_widget.set_image(frame)
 
+    def _display_snap_frames_in_viewer(self, frames, filepath=None):
+        """Display snap frames (from memory) in the viewer dialog
+
+        @param frames: Acquired frames array (counters, frames, rows, cols)
+        @param filepath: Optional file path if frames were saved to disk
+        """
+        # frames shape: (counters, frames, rows, cols)
+        num_frames = frames.shape[1]
+
+        # Update viewer dialog with frame info
+        display_path = filepath if filepath else "(In Memory - Not Saved)"
+        self._viewer_dialog.filepath_label.setText(f"File: {display_path}")
+        self._viewer_dialog.frame_info_label.setText(f"Frames: {num_frames}")
+        self._viewer_dialog._frame_count = num_frames
+        self._viewer_dialog.frame_slider.setMaximum(max(0, num_frames - 1))
+        self._viewer_dialog.frame_slider.setValue(0)
+        self._viewer_dialog._current_frame = 0
+        self._viewer_dialog._update_frame_counter()
+        self._viewer_dialog._update_button_states()
+
+        # Disconnect old signal and connect to memory-based frame display
+        try:
+            self._viewer_dialog.frame_slider.valueChanged.disconnect()
+        except:
+            pass
+
+        # Create lambda that captures frames from memory
+        self._viewer_dialog.frame_slider.valueChanged.connect(
+            lambda idx: self._display_snap_frame_by_index(frames, idx)
+        )
+
+        # Display first frame
+        self._display_snap_frame_by_index(frames, 0)
+
+        # Show viewer dialog
+        self._viewer_dialog.exec_()
+
+    def _display_snap_frame_by_index(self, frames, frame_index):
+        """Display a specific frame from in-memory snap frames
+
+        @param frames: Frames array (counters, frames, rows, cols)
+        @param frame_index: Index of frame to display (0-based)
+        """
+        if frames is None or frame_index < 0 or frame_index >= frames.shape[1]:
+            return
+
+        # Extract frame (counter 0, specific frame index, all rows/cols)
+        frame = frames[0, frame_index, :, :]
+
+        # Update dialog state
+        self._viewer_dialog._current_frame = frame_index
+        self._viewer_dialog._update_frame_counter()
+        self._viewer_dialog._update_button_states()
+
+        # Display the frame
+        self._mw.image_widget.set_image(frame)
+
     def _snap_clicked(self):
         """Handle snap button click - acquire first, then optionally save"""
         logic = self._camera_logic()
+        camera = logic._camera()
         camera = logic._camera()
 
         # Step 1: Acquire frames
@@ -743,6 +802,9 @@ class CameraGui(GuiBase):
 
         # Get actual requested frame count from hardware (array may have buffer data)
         num_frames = camera._NFrames if hasattr(camera, "_NFrames") else frames.shape[1]
+
+        # Crop to requested frames and store in memory
+        self._snap_frames = frames[:, :num_frames, :, :]
 
         # Step 2: Ask if user wants to save
         reply = QtWidgets.QMessageBox.question(
@@ -769,7 +831,7 @@ class CameraGui(GuiBase):
                     filepath += ".spc3"
 
                 # Save frames to file
-                success = logic.save_frames_to_file(frames, filepath)
+                success = logic.save_frames_to_file(self._snap_frames, filepath)
 
                 if not success:
                     QtWidgets.QMessageBox.warning(
