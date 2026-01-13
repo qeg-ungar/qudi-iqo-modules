@@ -787,6 +787,7 @@ class CameraGui(GuiBase):
         """Handle snap button click - acquire first, then optionally save"""
         logic = self._camera_logic()
         camera = logic._camera()
+        camera = logic._camera()
 
         # Step 1: Acquire frames
         frames = logic.start_single_acquisition()
@@ -848,10 +849,60 @@ class CameraGui(GuiBase):
             QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
             QtWidgets.QMessageBox.Yes,
         )
-
+        # andrew left a note
         if view_reply == QtWidgets.QMessageBox.Yes:
-            # Display frames from memory (always available, no file needed)
-            self._display_snap_frames_in_viewer(self._snap_frames, filepath)
+            # If we saved to file, load from file (for consistency)
+            # Otherwise, load frames directly from memory
+            if filepath:
+                if logic.load_acquisition_file(filepath):
+                    frame_count = logic.get_loaded_frame_count()
+                    self._viewer_dialog.set_file_info(filepath, frame_count)
+
+                    # Connect slider if not already connected
+                    try:
+                        self._viewer_dialog.frame_slider.valueChanged.disconnect(
+                            self._on_viewer_frame_changed
+                        )
+                    except:
+                        pass
+
+                    self._viewer_dialog.frame_slider.valueChanged.connect(
+                        self._on_viewer_frame_changed
+                    )
+
+                    # Show first frame
+                    self._on_viewer_frame_changed(0)
+
+                    # Show viewer dialog
+                    self._viewer_dialog.exec_()
+            else:
+                # No file saved, load frames directly from memory
+                if logic.load_frames_from_memory(frames):
+                    frame_count = num_frames
+                    filepath_display = logic.get_loaded_filepath()
+                    self._viewer_dialog.set_file_info(filepath_display, frame_count)
+
+                    # Connect slider if not already connected
+                    try:
+                        self._viewer_dialog.frame_slider.valueChanged.disconnect(
+                            self._on_viewer_frame_changed
+                        )
+                    except:
+                        pass
+
+                    self._viewer_dialog.frame_slider.valueChanged.connect(
+                        self._on_viewer_frame_changed
+                    )
+
+                    # Show first frame
+                    self._on_viewer_frame_changed(0)
+
+                    # Show viewer dialog
+                    self._viewer_dialog.exec_()
+                else:
+                    QtWidgets.QMessageBox.warning(
+                        self._mw, "View Error", "Failed to load frames for viewing."
+                    )
 
     def _start_video_clicked(self, checked):
         if checked:
