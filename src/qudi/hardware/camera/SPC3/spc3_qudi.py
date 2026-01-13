@@ -406,6 +406,10 @@ class SPC3_Qudi(CameraInterface):
                 counter1_frame.astype(np.float32) / exposure_time_seconds
             ).astype(counter1_frame.dtype)
 
+        # Ensure 2D shape for GUI display (rows, cols)
+        if counter1_frame.ndim == 1:
+            counter1_frame = counter1_frame.reshape(self._Nrows, self._Ncols)
+
         return counter1_frame
 
     def set_exposure(self, exposure):
