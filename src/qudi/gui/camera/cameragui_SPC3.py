@@ -849,7 +849,7 @@ class CameraGui(GuiBase):
             QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
             QtWidgets.QMessageBox.Yes,
         )
-
+        # andrew left a note
         if view_reply == QtWidgets.QMessageBox.Yes:
             # If we saved to file, load from file (for consistency)
             # Otherwise, load frames directly from memory
@@ -881,7 +881,7 @@ class CameraGui(GuiBase):
                     frame_count = num_frames
                     filepath_display = logic.get_loaded_filepath()
                     self._viewer_dialog.set_file_info(filepath_display, frame_count)
-                    
+
                     # Connect slider if not already connected
                     try:
                         self._viewer_dialog.frame_slider.valueChanged.disconnect(
@@ -889,21 +889,19 @@ class CameraGui(GuiBase):
                         )
                     except:
                         pass
-                    
+
                     self._viewer_dialog.frame_slider.valueChanged.connect(
                         self._on_viewer_frame_changed
                     )
-                    
+
                     # Show first frame
                     self._on_viewer_frame_changed(0)
-                    
+
                     # Show viewer dialog
                     self._viewer_dialog.exec_()
                 else:
                     QtWidgets.QMessageBox.warning(
-                        self._mw,
-                        "View Error",
-                        "Failed to load frames for viewing."
+                        self._mw, "View Error", "Failed to load frames for viewing."
                     )
 
     def _start_video_clicked(self, checked):
