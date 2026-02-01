@@ -333,7 +333,9 @@ class SPC3_Qudi(CameraInterface):
             frames = np.array(frames_list)
 
             self._acquiring = False
-            self.log.info(f"Snap acquisition complete: shape={frames.shape}, dtype={frames.dtype}")
+            self.log.info(
+                f"Snap acquisition complete: shape={frames.shape}, dtype={frames.dtype}"
+            )
             return frames
 
         except Exception as e:

@@ -294,6 +294,46 @@ class CameraLogic(LogicBase):
                 self.module_state.unlock()
                 self.sigAcquisitionFinished.emit()
 
+    def start_scan(self):
+        """Start scan acquisition"""
+        with self._thread_lock:
+            if self.module_state() == "idle":
+                camera = self._camera()
+                try:
+                    result = camera.start_scan()
+                    if not result:
+                        self.log.warning("Failed to start scan acquisition")
+                    return result
+                except AttributeError:
+                    self.log.error("start_scan method not implemented")
+                    return False
+                except Exception as e:
+                    self.log.error(f"Error starting scan acquisition: {e}")
+                    return False
+            else:
+                self.log.error("Unable to start scan. Acquisition still in progress.")
+                return False
+
+    def stop_scan(self):
+        """Stop scan acquisition"""
+        with self._thread_lock:
+            if self.module_state() == "locked":
+                camera = self._camera()
+                try:
+                    result = camera.stop_scan()
+                    if not result:
+                        self.log.warning("Failed to stop scan acquisition")
+                    return result
+                except AttributeError:
+                    self.log.error("stop_scan method not implemented")
+                    return False
+                except Exception as e:
+                    self.log.error(f"Error stopping scan acquisition: {e}")
+                    return False
+            else:
+                self.log.error("Unable to stop scan. No scan in progress.")
+                return False
+
     def capture_background_image(self):
         """Capture background image for background subtraction"""
         with self._thread_lock:

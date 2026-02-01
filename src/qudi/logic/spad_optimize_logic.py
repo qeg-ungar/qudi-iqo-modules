@@ -273,7 +273,7 @@ class ScanningOptimizeLogic(LogicBase):
             if self.module_state() != "idle":
                 self.log.error("Cannot change optimize settings when module is locked.")
             else:
-                self._data_channel = data_channel
+                # self._data_channel = data_channel
                 self.optimizer_sequence_dimensions = scan_dimension
                 self.scan_sequence = scan_sequence
                 self._scan_range.update(range)

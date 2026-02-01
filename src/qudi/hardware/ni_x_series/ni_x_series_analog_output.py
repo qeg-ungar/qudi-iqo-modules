@@ -26,7 +26,7 @@ top-level directory of this distribution and at <https://github.com/Ulm-IQO/qudi
 import nidaqmx as ni
 
 from qudi.util.mutex import Mutex
-from qudi.core.configoption import ConfigOption
+from qudi.core .configoption import ConfigOption
 from qudi.core.statusvariable import StatusVar
 from qudi.util.helpers import natural_sort, in_range
 

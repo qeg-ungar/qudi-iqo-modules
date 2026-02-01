@@ -46,7 +46,8 @@ from qudi.util.linear_transform import (
     compute_reduced_vectors,
 )
 from qudi.interface.scanning_probe_interface import ScanningProbeInterface
-from qudi.interface.camera_interface import CameraInterface
+from qudi.interface.camera_interface import CameraInterface, SPADScanSettings
+
 
 class SpadProbeLogic(LogicBase):
     """
@@ -74,12 +75,16 @@ class SpadProbeLogic(LogicBase):
     # status vars
     _scan_ranges = StatusVar(name="scan_ranges", default=dict())
     _scan_resolution = StatusVar(name="scan_resolution", default=dict())
-    _back_scan_resolution = StatusVar(name="back_scan_resolution", default=dict())
+    _back_scan_resolution = StatusVar(
+        name="back_scan_resolution", default=dict()
+    )  # needed?
     _scan_frequency = StatusVar(name="scan_frequency", default=dict())
-    _back_scan_frequency = StatusVar(name="back_scan_frequency", default=dict())
+    _back_scan_frequency = StatusVar(
+        name="back_scan_frequency", default=dict()
+    )  # needed?
     _use_back_scan_settings: bool = StatusVar(
         name="use_back_scan_settings", default=False
-    )
+    )  # needed?
     _tilt_corr_settings = StatusVar(name="tilt_corr_settings", default={})
 
     # config options
@@ -128,7 +133,7 @@ class SpadProbeLogic(LogicBase):
             # defaults to maximum scan frequency of scanner
             self._min_poll_interval = 1 / max(
                 [axes[ax].frequency.maximum for ax in axes]
-            )
+            )  # how do we determine this for spad?
 
         self.__scan_poll_interval = 0
         self.__scan_stop_requested = True
@@ -152,12 +157,14 @@ class SpadProbeLogic(LogicBase):
     @property
     def scan_data(self) -> Optional[ScanData]:
         with self._thread_lock:
-            return self._scanner().get_scan_data()
+            # return self._scanner().get_scan_data()
+            # REPLACE with camera
 
     @property
     def back_scan_data(self) -> Optional[ScanData]:
         with self._thread_lock:
-            return self._scanner().get_back_scan_data()
+            # return self._scanner().get_back_scan_data()
+            # REPLACE with camera
 
     @property
     def scanner_position(self):
@@ -642,13 +649,16 @@ class SpadProbeLogic(LogicBase):
             back_settings = self.create_back_scan_settings(tuple(scan_axes))
             self.log.debug("Attempting to configure scanner...")
             try:
-                self._scanner().configure_scan(settings)
+                # self._scanner().configure_scan(settings)
+                # REPLACE
+                self.
                 if (
                     self._use_back_scan_settings
                     and BackScanCapability.FULLY_CONFIGURABLE
                     & self.back_scan_capability
                 ):
-                    self._scanner().configure_back_scan(back_settings)
+                    # self._scanner().configure_back_scan(back_settings)
+                    # REPLACE
             except Exception as e:
                 self.module_state.unlock()
                 self.sigScanStateChanged.emit(False, None, None, self._curr_caller_id)
@@ -674,7 +684,7 @@ class SpadProbeLogic(LogicBase):
             self.__scan_poll_timer.setInterval(t_poll_ms)
 
             try:
-                self._scanner().start_scan()
+                self._camera().start_spad_scan() # ADD
             except Exception as e:
                 self.module_state.unlock()
                 self.sigScanStateChanged.emit(False, None, None, self._curr_caller_id)
@@ -697,8 +707,8 @@ class SpadProbeLogic(LogicBase):
             self.__stop_timer()
 
             try:
-                if self._scanner().module_state() != "idle":
-                    self._scanner().stop_scan()
+                if self._scanner().module_state() != "idle" or self._camera().module_state() != "idle":
+                    self._camera().stop_scan() # ADD
             finally:
                 self.module_state.unlock()
                 self.sigScanStateChanged.emit(
@@ -715,7 +725,7 @@ class SpadProbeLogic(LogicBase):
                 if self.module_state() == "idle":
                     return
 
-                if self._scanner().module_state() == "idle":
+                if self._scanner().module_state() != "idle" or self._camera().module_state() != "idle":
                     self.stop_scan()
                     return
                 # TODO Added the following line as a quick test; Maybe look at it with more caution if correct
