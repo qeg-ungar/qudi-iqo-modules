@@ -111,7 +111,7 @@ class SPC3(object):
 
             lib_dir = os.path.join(self.lib_root_dir, 'Win/')
             lib_path = os.path.join(lib_dir, '{}.dll'.format(self.lib_alias))
-            
+
             if sys.version_info.minor < 8:
                 os.environ['PATH'] = lib_dir + os.pathsep + os.environ['PATH']
 
@@ -1471,115 +1471,6 @@ class SPC3(object):
 
         Parameters
             path: path to the .hrm data file
-        Returns:
-            data file header and frames
-        """
-        def readfield(inf, count, c_type):
-            if c_type is None:
-                inf.read(count)
-                return
-            bs = bytearray(inf.read(count * sizeof(c_type)))
-            if count > 1:
-                return (c_type * count).from_buffer_copy(bs).value
-            else:
-                return c_type.from_buffer_copy(bs).value
-
-        inf = open(path, 'rb')
-
-        file_meta_stuff = readfield(inf, 8, c_char)
-
-        class HermesFileHeader():
-            pass
-
-        header = HermesFileHeader
-
-        header.camera_id = readfield(inf, 10, c_char).decode('utf-8')
-
-        header.SN = readfield(inf, 32, c_char).decode('utf-8')
-
-        header.FW_VER = readfield(inf, 1, c_uint16) / 100
-        header.custom_ver = chr(readfield(inf, 1, c_uint8) + ord('A'))  # 0 = A, 1 = B, etc
-        header.date_time = readfield(inf, 20, c_char).decode('utf-8')
-
-        readfield(inf, 35, None)
-
-        header.N_rows = readfield(inf, 1, c_uint8)
-        header.N_cols = readfield(inf, 1, c_uint8)
-        header.bit_x_pix = readfield(inf, 1, c_uint8)
-        header.N_counters = readfield(inf, 1, c_uint8)
-        header.HwIntTime = readfield(inf, 1, c_uint16) * 10e-9
-        header.SummedFrames = readfield(inf, 1, c_uint16)
-        header.DeadTimeCorrectionON = readfield(inf, 1, c_uint8) != 0
-        header.GateDuty_C1 = readfield(inf, 1, c_uint8)
-        header.HoldOff = readfield(inf, 1, c_uint16) * 1e-9
-        header.BKGsubON = readfield(inf, 1, c_uint8) != 0
-        header.C1_2_signed = readfield(inf, 1, c_uint8) != 0
-        header.N_frames = readfield(inf, 1, c_uint32)
-        header.ImgAveraged = readfield(inf, 1, c_uint8) != 0
-        header.Caveraged = readfield(inf, 1, c_uint8)
-        header.N_ave = readfield(inf, 1, c_uint16)
-        header.GateDuty_C2 = readfield(inf, 1, c_uint8)
-        header.GateDuty_C3 = readfield(inf, 1, c_uint8)
-        header.Frames_x_syncIn = readfield(inf, 1, c_uint16)
-        header.N_pix = readfield(inf, 1, c_uint16)
-        readfield(inf, 72, None)
-
-        header.FLIM_ON = readfield(inf, 1, c_uint8) != 0
-        header.FLIM_shift_pct = readfield(inf, 1, c_uint16)
-        header.FLIM_steps = readfield(inf, 1, c_uint16)
-        header.FLIM_frameLen = readfield(inf, 1, c_uint32) * 10e-9
-        header.FLIM_binWidth = readfield(inf, 1, c_uint16) * 1e-15
-        readfield(inf, 9, None)
-
-        header.MultiGate_mode = readfield(inf, 1, c_uint8)
-        header.MultiGate_start_pos = readfield(inf, 1, c_int16)
-        header.MultiGate_widthC1 = readfield(inf, 1, c_uint8)
-        header.MultiGate_widthC2 = readfield(inf, 1, c_uint8)
-        header.MultiGate_widthC3 = readfield(inf, 1, c_uint8)
-        header.MultiGate_gapC1_2 = readfield(inf, 1, c_uint16)
-        header.MultiGate_gapC2_3 = readfield(inf, 1, c_uint16)
-        header.MultiGate_binWidth = readfield(inf, 1, c_uint16) * 1e-15
-
-        header.CoarseGate_C1_ON = readfield(inf, 1, c_uint8) != 0
-        header.CoarseGate_C1_startPos = readfield(inf, 1, c_uint16) * 10e-9
-        header.CoarseGate_C1_stopPos = readfield(inf, 1, c_uint16) * 10e-9
-        header.CoarseGate_C2_ON = readfield(inf, 1, c_uint8) != 0
-        header.CoarseGate_C2_startPos = readfield(inf, 1, c_uint16) * 10e-9
-        header.CoarseGate_C2_stopPos = readfield(inf, 1, c_uint16) * 10e-9
-        header.CoarseGate_C3_ON = readfield(inf, 1, c_uint8) != 0
-        header.CoarseGate_C3_startPos = readfield(inf, 1, c_uint16) * 10e-9
-        header.CoarseGate_C3_stopPos = readfield(inf, 1, c_uint16) * 10e-9
-        readfield(inf, 53, None)
-
-        header.PDE_ON = readfield(inf, 1, c_uint8) != 0
-        header.PDE_startWave = readfield(inf, 1, c_uint16) * 1e-9
-        header.PDE_stopWave = readfield(inf, 1, c_uint16) * 1e-9
-        header.PDE_step = readfield(inf, 1, c_uint16) * 1e-9
-
-        data_count = header.N_cols * header.N_rows * header.N_frames * header.N_counters
-
-        if header.bit_x_pix == 16:
-            dtype = np.uint16
-        elif header.bit_x_pix == 8:
-            dtype = np.uint8
-        else:
-            raise ValueError('invalid bit width, got {}'.format(str(header.bit_x_pix)))
-        inf.seek(0)
-        data = np.fromfile(inf, offset=1024 + 8, count=data_count, dtype=dtype)
-
-        num_pixels = header.N_pix
-        num_counters = header.N_counters
-        frames = SPC3.BufferToFrames(data, num_pixels, num_counters)
-
-        return frames, header
-
-    @staticmethod
-    def ReadSPC3DataFile(path):
-        """ReadSPC3DataFile - reads .spc3 acquisition files
-        or "raw" data read from hermes data files to a more structured data set containing multiple frames
-
-        Parameters
-            path: path to the .spc3 data file
         Returns:
             data file header and frames
         """

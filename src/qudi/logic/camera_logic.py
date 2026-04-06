@@ -34,7 +34,7 @@ from qudi.interface.camera_interface import CameraInterface
 
 
 class CameraLogic(LogicBase):
-    """ Logic class for controlling a camera.
+    """Logic class for controlling a camera.
 
     Example config for copy-paste:
 
@@ -47,11 +47,11 @@ class CameraLogic(LogicBase):
     """
 
     # declare connectors
-    _camera = Connector(name='camera', interface=CameraInterface)
+    _camera = Connector(name="camera", interface=CameraInterface)
     # declare config options
-    _minimum_exposure_time = ConfigOption(name='minimum_exposure_time',
-                                          default=0.05,
-                                          missing='warn')
+    _minimum_exposure_time = ConfigOption(
+        name="minimum_exposure_time", default=0.05, missing="warn"
+    )
 
     # signals
     sigFrameChanged = QtCore.Signal(object)
@@ -66,8 +66,7 @@ class CameraLogic(LogicBase):
         self._last_frame = None
 
     def on_activate(self):
-        """ Initialisation performed during activation of the module.
-        """
+        """Initialisation performed during activation of the module."""
         camera = self._camera()
         self._exposure = camera.get_exposure()
         self._gain = camera.get_gain()
@@ -77,7 +76,7 @@ class CameraLogic(LogicBase):
         self.__timer.timeout.connect(self.__acquire_video_frame)
 
     def on_deactivate(self):
-        """ Perform required deactivation. """
+        """Perform required deactivation."""
         self.__timer.stop()
         self.__timer.timeout.disconnect()
         self.__timer = None
@@ -87,29 +86,31 @@ class CameraLogic(LogicBase):
         return self._last_frame
 
     def set_exposure(self, time):
-        """ Set exposure time of camera """
+        """Set exposure time of camera"""
         with self._thread_lock:
-            if self.module_state() == 'idle':
+            if self.module_state() == "idle":
                 camera = self._camera()
                 camera.set_exposure(time)
                 self._exposure = camera.get_exposure()
             else:
-                self.log.error('Unable to set exposure time. Acquisition still in progress.')
+                self.log.error(
+                    "Unable to set exposure time. Acquisition still in progress."
+                )
 
     def get_exposure(self):
-        """ Get exposure of hardware """
+        """Get exposure of hardware"""
         with self._thread_lock:
             self._exposure = self._camera().get_exposure()
             return self._exposure
 
     def set_gain(self, gain):
         with self._thread_lock:
-            if self.module_state() == 'idle':
+            if self.module_state() == "idle":
                 camera = self._camera()
                 camera.set_gain(gain)
                 self._gain = camera.get_gain()
             else:
-                self.log.error('Unable to set gain. Acquisition still in progress.')
+                self.log.error("Unable to set gain. Acquisition still in progress.")
 
     def get_gain(self):
         with self._thread_lock:
@@ -117,10 +118,9 @@ class CameraLogic(LogicBase):
             return self._gain
 
     def capture_frame(self):
-        """
-        """
+        """ """
         with self._thread_lock:
-            if self.module_state() == 'idle':
+            if self.module_state() == "idle":
                 self.module_state.lock()
                 camera = self._camera()
                 camera.start_single_acquisition()
@@ -129,7 +129,9 @@ class CameraLogic(LogicBase):
                 self.sigFrameChanged.emit(self._last_frame)
                 self.sigAcquisitionFinished.emit()
             else:
-                self.log.error('Unable to capture single frame. Acquisition still in progress.')
+                self.log.error(
+                    "Unable to capture single frame. Acquisition still in progress."
+                )
 
     def toggle_video(self, start):
         if start:
@@ -138,10 +140,9 @@ class CameraLogic(LogicBase):
             self._stop_video()
 
     def _start_video(self):
-        """ Start the data recording loop.
-        """
+        """Start the data recording loop."""
         with self._thread_lock:
-            if self.module_state() == 'idle':
+            if self.module_state() == "idle":
                 self.module_state.lock()
                 exposure = max(self._exposure, self._minimum_exposure_time)
                 camera = self._camera()
@@ -151,26 +152,26 @@ class CameraLogic(LogicBase):
                     camera.start_single_acquisition()
                 self.__timer.start(1000 * exposure)
             else:
-                self.log.error('Unable to start video acquisition. Acquisition still in progress.')
+                self.log.error(
+                    "Unable to start video acquisition. Acquisition still in progress."
+                )
 
     def _stop_video(self):
-        """ Stop the data recording loop.
-        """
+        """Stop the data recording loop."""
         with self._thread_lock:
-            if self.module_state() == 'locked':
+            if self.module_state() == "locked":
                 self.__timer.stop()
                 self._camera().stop_acquisition()
                 self.module_state.unlock()
                 self.sigAcquisitionFinished.emit()
 
     def __acquire_video_frame(self):
-        """ Execute step in the data recording loop: save one of each control and process values
-        """
+        """Execute step in the data recording loop: save one of each control and process values"""
         with self._thread_lock:
             camera = self._camera()
             self._last_frame = camera.get_acquired_data()
             self.sigFrameChanged.emit(self._last_frame)
-            if self.module_state() == 'locked':
+            if self.module_state() == "locked":
                 exposure = max(self._exposure, self._minimum_exposure_time)
                 self.__timer.start(1000 * exposure)
                 if not camera.support_live_acquisition():
@@ -182,13 +183,15 @@ class CameraLogic(LogicBase):
     def draw_2d_image(self, data, cbar_range=None):
         # Create image plot
         fig, ax = plt.subplots()
-        cfimage = ax.imshow(data,
-                            cmap='inferno',  # FIXME: reference the right place in qudi
-                            origin='lower',
-                            interpolation='none')
+        cfimage = ax.imshow(
+            data,
+            cmap="inferno",  # FIXME: reference the right place in qudi
+            origin="lower",
+            interpolation="none",
+        )
 
         if cbar_range is None:
             cbar_range = (np.nanmin(data), np.nanmax(data))
         cbar = plt.colorbar(cfimage, shrink=0.8)
-        cbar.ax.tick_params(which=u'both', length=0)
+        cbar.ax.tick_params(which="both", length=0)
         return fig
