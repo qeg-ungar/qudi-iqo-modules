@@ -135,7 +135,13 @@ class SPC3_Qudi(CameraInterface):
         self._trigger_frames_per_pulse = max(
             1, min(int(self._cfg_trigger_frames_per_pulse), 100)
         )
-        self._gate_mode = str(self._cfg_gate_mode)
+        gate_mode_raw = str(self._cfg_gate_mode).strip().lower()
+        if gate_mode_raw not in ("off", "coarse"):
+            raise ValueError(
+                "gate_mode must be one of {'off','coarse'} (case-insensitive), "
+                f"got {self._cfg_gate_mode!r}"
+            )
+        self._gate_mode = gate_mode_raw
         self._coarse_gate_start = int(self._cfg_coarse_gate_start)
         self._coarse_gate_stop = int(self._cfg_coarse_gate_stop)
 
@@ -277,6 +283,11 @@ class SPC3_Qudi(CameraInterface):
 
             # Ensure all settings (gate, trigger) are committed
             self._commit_settings()
+
+            # Snapshot the gate settings that were applied to this acquisition.
+            self._last_acq_gate_mode = self._gate_mode
+            self._last_acq_coarse_gate_start = self._coarse_gate_start
+            self._last_acq_coarse_gate_stop = self._coarse_gate_stop
 
             # Prepare camera for snap
             self._spc.SnapPrepare()
@@ -655,10 +666,29 @@ class SPC3_Qudi(CameraInterface):
             if directory:
                 os.makedirs(directory, exist_ok=True)
 
+            # Snapshot the gate settings that will apply for this run.
+            self._cont_gate_mode = self._gate_mode
+            self._cont_coarse_gate_start = self._coarse_gate_start
+            self._cont_coarse_gate_stop = self._coarse_gate_stop
+
             self._spc.ContAcqToFileStart(filename)
             self._continuous = True
             self._cont_filename = filename
             self.log.info(f"ContAcqToFileStart -> {filename}")
+
+            # Best-effort: patch the output header early so even an interrupted
+            # run preserves the gate metadata in the file header.
+            try:
+                expected = filename + ".spc3"
+                if os.path.exists(expected):
+                    self._patch_spc3_coarse_gate_header(
+                        expected,
+                        gate_mode=getattr(self, "_cont_gate_mode", None),
+                        start_cycles=getattr(self, "_cont_coarse_gate_start", None),
+                        stop_cycles=getattr(self, "_cont_coarse_gate_stop", None),
+                    )
+            except Exception:
+                pass
             return True
         except Exception as e:
             self._continuous = False
@@ -672,6 +702,20 @@ class SPC3_Qudi(CameraInterface):
                 self._spc.ContAcqToFileStop()
             except Exception as e:
                 self.log.error(f"Failed to stop continuous acquisition: {e}")
+
+            # After closing the file, stamp coarse gate metadata (SDK currently
+            # leaves these fields at 0 even when gating is active).
+            try:
+                stem = getattr(self, "_cont_filename", "")
+                for out_path in self._list_written_spc3_paths(stem):
+                    self._patch_spc3_coarse_gate_header(
+                        out_path,
+                        gate_mode=getattr(self, "_cont_gate_mode", None),
+                        start_cycles=getattr(self, "_cont_coarse_gate_start", None),
+                        stop_cycles=getattr(self, "_cont_coarse_gate_stop", None),
+                    )
+            except Exception:
+                pass
             self._continuous = False
         return True
 
@@ -708,6 +752,7 @@ class SPC3_Qudi(CameraInterface):
 
             expected = filepath + ".spc3"
             if os.path.exists(expected):
+                self._patch_spc3_coarse_gate_header(expected)
                 return True
 
             self.log.error(f"SaveImgDisk completed but file not found: {expected}")
@@ -750,6 +795,12 @@ class SPC3_Qudi(CameraInterface):
 
             expected = filepath + ".spc3"
             if os.path.exists(expected):
+                self._patch_spc3_coarse_gate_header(
+                    expected,
+                    gate_mode=getattr(self, "_last_acq_gate_mode", None),
+                    start_cycles=getattr(self, "_last_acq_coarse_gate_start", None),
+                    stop_cycles=getattr(self, "_last_acq_coarse_gate_stop", None),
+                )
                 return True
 
             self.log.error(f"SaveImgDisk completed but file not found: {expected}")
@@ -778,6 +829,149 @@ class SPC3_Qudi(CameraInterface):
 
         except Exception as e:
             self.log.error(f"Failed to load {filepath}: {e}")
+            return False
+
+    def _resolve_written_spc3_path(self, filepath_stem):
+        """Resolve the actual .spc3 path written by the SDK.
+
+        The SPC3 SDK typically appends the extension and may also append digits
+        if the target already exists. We resolve to the most-recent matching file.
+
+        @param str filepath_stem: path without extension
+        @return str: path to an existing .spc3 file
+        """
+        filepath_stem = os.path.normpath(str(filepath_stem))
+        if not filepath_stem:
+            raise ValueError("filepath_stem is empty")
+
+        expected = filepath_stem + ".spc3"
+        if os.path.exists(expected):
+            return expected
+
+        directory = os.path.dirname(expected) or os.curdir
+        base = os.path.basename(filepath_stem)
+
+        try:
+            entries = os.listdir(directory)
+        except FileNotFoundError:
+            return expected
+
+        base_l = base.lower()
+        candidates = [
+            os.path.join(directory, name)
+            for name in entries
+            if name.lower().startswith(base_l) and name.lower().endswith(".spc3")
+        ]
+        if not candidates:
+            return expected
+        return max(candidates, key=os.path.getmtime)
+
+    def _list_written_spc3_paths(self, filepath_stem):
+        """List all .spc3 files written for a given stem.
+
+        The SPC3 SDK may split a long run into multiple files by appending an
+        integer suffix: <stem>.spc3, <stem>2.spc3, <stem>3.spc3, ...
+
+        We return only files whose name matches exactly <base><digits>.spc3
+        (digits may be empty), ignoring unrelated similarly-named files.
+
+        @param str filepath_stem: path without extension
+        @return list[str]: existing .spc3 paths, sorted by numeric suffix
+        """
+        filepath_stem = os.path.normpath(str(filepath_stem))
+        if not filepath_stem:
+            return []
+        if filepath_stem.lower().endswith(".spc3"):
+            filepath_stem = filepath_stem[:-5]
+
+        directory = os.path.dirname(filepath_stem) or os.curdir
+        base = os.path.basename(filepath_stem)
+        base_l = base.lower()
+
+        try:
+            names = os.listdir(directory)
+        except FileNotFoundError:
+            return []
+
+        hits = []
+        for name in names:
+            name_l = name.lower()
+            if not name_l.endswith(".spc3"):
+                continue
+            if not name_l.startswith(base_l):
+                continue
+
+            suffix = name[len(base) : -5]
+            if suffix and not suffix.isdigit():
+                continue
+
+            idx = int(suffix) if suffix else 1
+            hits.append((idx, os.path.join(directory, name)))
+
+        hits.sort(key=lambda t: t[0])
+        return [p for _, p in hits]
+
+    def _patch_spc3_coarse_gate_header(
+        self,
+        filepath,
+        gate_mode=None,
+        start_cycles=None,
+        stop_cycles=None,
+    ):
+        """Stamp coarse-gate metadata into an existing .spc3 header.
+
+        Empirically, the SPC3 SDK leaves the coarse-gate header bytes at 0 even
+        when SetGateMode(COARSE) is active. The file format reserves:
+          metadata[232]   : coarse gate 1 enabled (uint8)
+          metadata[233:235]: coarse gate 1 start (uint16, 10 ns cycles)
+          metadata[235:237]: coarse gate 1 stop  (uint16, 10 ns cycles)
+
+        This method patches the header in-place so SPC3.ReadSPC3DataFile() will
+        report gating correctly.
+
+        @return bool: True if patched, False if skipped/failed.
+        """
+        filepath = os.path.normpath(str(filepath))
+        if not os.path.exists(filepath):
+            return False
+
+        # Only stamp when gate is enabled; leave files untouched otherwise.
+        if gate_mode is None:
+            gate_mode = getattr(self, "_gate_mode", "off")
+        if gate_mode != "coarse":
+            return False
+
+        if start_cycles is None:
+            start_cycles = getattr(self, "_coarse_gate_start", 0)
+        if stop_cycles is None:
+            stop_cycles = getattr(self, "_coarse_gate_stop", 0)
+
+        start = int(start_cycles)
+        stop = int(stop_cycles)
+        start = max(0, min(start, 65535))
+        stop = max(0, min(stop, 65535))
+
+        try:
+            with open(filepath, "r+b") as f:
+                # signature (8 bytes) + metadata (1024 bytes)
+                f.seek(8 + 232)
+                f.write(
+                    struct.pack(
+                        "<BHHBHHBHH",
+                        1,
+                        start,
+                        stop,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                    )
+                )
+            return True
+        except Exception as e:
+            self.log.warning(f"Failed to patch coarse gate metadata in {filepath}: {e}")
             return False
 
     # ── Gate control ───────────────────────────────────────────────────
@@ -858,6 +1052,12 @@ class SPC3_Qudi(CameraInterface):
 
     def _apply_gate_settings(self):
         """Configure coarse gating on counter 1."""
+        if self._gate_mode not in ("off", "coarse"):
+            raise ValueError(
+                "Internal gate_mode must be 'off' or 'coarse', "
+                f"got {self._gate_mode!r}"
+            )
+
         if self._gate_mode != "off" and self._camera_mode != "Advanced":
             self.log.warning(
                 "Coarse gating requires Advanced mode — gate will NOT be applied"
