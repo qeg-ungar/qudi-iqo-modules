@@ -358,6 +358,21 @@ class SpadOptimizeLogic(LogicBase):
                 self.sigOptimizeStateChanged.emit(True, dict(), None)
                 return
 
+            # If the scan sequence is overridden programmatically (e.g. from a
+            # notebook), keep the optimizer plot dimensions in sync so the GUI
+            # can rebuild matching 1D/2D widgets.
+            try:
+                seq = self.scan_sequence
+                if seq:
+                    desired_dims = tuple(len(step) for step in seq)
+                    if tuple(self._optimizer_sequence_dimensions) != desired_dims:
+                        self.optimizer_sequence_dimensions = desired_dims
+            except Exception:
+                # Never block optimize start due to GUI bookkeeping.
+                self.log.debug(
+                    "Failed to sync optimizer_sequence_dimensions to scan_sequence"
+                )
+
             # Ensure camera is not in live mode (snap requires it)
             if hasattr(camera, "_live") and camera._live:
                 self.log.error(
@@ -470,14 +485,42 @@ class SpadOptimizeLogic(LogicBase):
                 self._scan_logic().set_target_position(pos, move_blocking=True)
 
                 # Snap configured number of frames and average
-                raw_frames = self._camera().start_single_acquisition()
-                if raw_frames is not None:
-                    # raw_frames shape: (counters, frames, cols, rows)
-                    # Background subtraction already applied by hardware
-                    avg_frame = raw_frames[0].mean(axis=0)  # (cols, rows)
+                camera = self._camera()
+                ok = camera.start_single_acquisition()
+                if ok:
+                    avg_frame = None
+
+                    # CameraInterface.start_single_acquisition() returns a bool.
+                    # The SPC3 hardware module caches the snap stack and exposes
+                    # it via get_last_snap_sequence() (frames, rows, cols).
+                    if hasattr(camera, "get_last_snap_sequence"):
+                        try:
+                            snap_stack = camera.get_last_snap_sequence(counter_index=0)
+                        except TypeError:
+                            # Backwards compatibility with older signatures.
+                            snap_stack = camera.get_last_snap_sequence()
+
+                        if snap_stack is not None:
+                            snap_stack = np.asarray(snap_stack)
+                            if snap_stack.ndim == 3:
+                                avg_frame = snap_stack.mean(axis=0)
+                            elif snap_stack.ndim == 2:
+                                avg_frame = snap_stack
+
+                    # Fallback: use the standard interface method (2-D frame).
+                    if avg_frame is None:
+                        avg_frame = np.asarray(camera.get_acquired_data())
+
+                    # Ensure 2-D
+                    if avg_frame is not None and avg_frame.ndim != 2:
+                        avg_frame = np.squeeze(avg_frame)
+
                     self._current_step_frames.append(avg_frame)
                 else:
-                    self.log.warning(f"Snap failed at position {idx + 1}/{total}")
+                    self.log.warning(
+                        f"Snap failed at position {idx + 1}/{total} "
+                        f"(camera returned {ok!r})"
+                    )
                     self._current_step_frames.append(None)
 
                 if (idx + 1) % max(1, total // 10) == 0 or idx + 1 == total:
@@ -666,7 +709,29 @@ class SpadOptimizeLogic(LogicBase):
             or self._scan_sequence not in possible_scan_sequences
         ):
 
-            fallback_scan_sequence = possible_scan_sequences[0]
+            # Prefer a sequence that sweeps two axes together and the remaining axis
+            # as the 1-D step. This matches the common "XY then Z" workflow and
+            # ensures the optimizer GUI has a 1-D widget for the third axis.
+            fallback_scan_sequence = None
+            dims = tuple(self._optimizer_sequence_dimensions)
+            axes_names = [ax.name for ax in self._avail_axes]
+
+            if len(axes_names) >= 3 and dims in ((2, 1), (1, 2)):
+                pair_2d = tuple(axes_names[:2])
+                remaining_1d = next(
+                    (ax for ax in axes_names if ax not in pair_2d), None
+                )
+                if remaining_1d is not None:
+                    preferred = (
+                        (pair_2d, (remaining_1d,))
+                        if dims == (2, 1)
+                        else ((remaining_1d,), pair_2d)
+                    )
+                    if preferred in possible_scan_sequences:
+                        fallback_scan_sequence = preferred
+
+            if fallback_scan_sequence is None:
+                fallback_scan_sequence = possible_scan_sequences[0]
             self.log.info(
                 f"No valid scan sequence existing ({self._scan_sequence=}),"
                 f" setting scan sequence to {fallback_scan_sequence}."

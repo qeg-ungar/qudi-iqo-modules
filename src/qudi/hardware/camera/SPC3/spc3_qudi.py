@@ -34,11 +34,10 @@ from ctypes import (
     c_int,
     c_short,
     c_void_p,
-    c_uint8,
+    c_uint32,
     c_uint16,
     POINTER,
     byref,
-    cast,
 )
 
 from qudi.core.configoption import ConfigOption
@@ -163,6 +162,9 @@ class SPC3_Qudi(CameraInterface):
         self._loaded_header = None
         self._loaded_filepath = None
 
+        # ── Continuous trigger logging state ───────────────────────────
+        self._cont_waiting_for_trigger = False
+
         # ── Construct SPC3 SDK object ──────────────────────────────────
         mode = (
             SPC3.CameraMode.ADVANCED
@@ -203,6 +205,7 @@ class SPC3_Qudi(CameraInterface):
             f"SPC3 activated ({self._camera_mode} mode): "
             f"HIT={self._effective_hit()} cycles ({hit_us:.2f} µs), "
             f"NInteg={self._NIntegFrames}, exposure={exp_s * 1e3:.2f} ms, "
+            f"NFrames (snap)={self._NFrames}, "
             f"array={self._NROWS}×{self._ncols}, "
             f"trigger={self._trigger_mode} (fps={self._trigger_frames_per_pulse}), "
             f"gate={self._gate_mode}"
@@ -305,15 +308,14 @@ class SPC3_Qudi(CameraInterface):
             # Acquire (blocks until all frames are downloaded)
             self._spc.SnapAcquire()
 
-            # Extract frames from SDK internal buffer
-            try:
-                frames = (
-                    self._spc.SnapGetImageBuffer().copy()
-                )  # detach from SDK-owned buffer
-            except AssertionError:
-                # Vendor wrapper asserts on cached _data_bits mismatch.
-                # Read the buffer using the SDK-reported DataDepth instead.
-                frames = self._snap_get_image_buffer_safe()
+            # Extract frames from the camera.
+            # NOTE: The SDK's internal snap buffer layout (returned by
+            # SPC3_Get_Image_Buffer) has proven unreliable to decode robustly
+            # across firmware/SDK variants (dtype/stride/padding quirks,
+            # especially with Half_array). The old, working module used
+            # SPC3_Get_Img_Position per frame/counter; that path is slower but
+            # robust and matches the live-mode geometry.
+            frames = self._snap_get_frames_by_position()
 
             # Cache a representative 2-D image for the generic camera GUI.
             # BufferToFrames returns (counters, frames, rows, cols).
@@ -351,39 +353,16 @@ class SPC3_Qudi(CameraInterface):
             return arr
         return None
 
-    def _snap_get_image_buffer_safe(self):
-        """Read snap buffer without relying on spc.py's cached _data_bits.
+    def _snap_get_frames_by_position(self):
+        """Extract snap frames via SPC3_Get_Img_Position (robust path).
 
-        The SDK returns a pointer to its internal image buffer plus an integer
-        DataDepth (8 or 16). We size and cast the buffer accordingly, then use
-        SPC3.BufferToFrames to get (counters, frames, rows, cols).
+        Returns:
+            numpy.ndarray: shape (counters, frames, rows, cols)
+
+        This matches the approach used by the known-good legacy module.
+        It avoids assumptions about the internal snap buffer layout.
         """
-        buf = POINTER(c_uint8)()
-        data_depth = c_int(0)
 
-        f = self._spc.dll.SPC3_Get_Image_Buffer
-        f.argtypes = [c_void_p, POINTER(POINTER(c_uint8)), POINTER(c_int)]
-        f.restype = c_int
-
-        ec = f(self._spc.c_handle, byref(buf), byref(data_depth))
-        self._spc._checkError(ec)
-
-        # Some SDK builds appear to return DataDepth=0 even on success.
-        # Treat that as "unknown" and fall back to the already-committed
-        # setting computed by ApplySettings()/Is16Bit().
-        depth = int(data_depth.value)
-        if depth not in (8, 16):
-            depth = int(getattr(self._spc, "_data_bits", 0) or 0)
-        if depth not in (8, 16):
-            try:
-                depth = 16 if self._spc.Is16Bit() else 8
-            except Exception:
-                depth = 16
-
-        if not bool(buf):
-            raise RuntimeError("SDK returned null image buffer pointer")
-
-        # Prefer SDK-maintained values, fall back to our config.
         num_frames = int(
             getattr(self._spc, "_snap_num_frames", self._NFrames) or self._NFrames
         )
@@ -394,23 +373,41 @@ class SPC3_Qudi(CameraInterface):
             getattr(self._spc, "_num_pixels", 0) or (1024 if self._half_array else 2048)
         )
 
-        size_bytes = num_frames * (depth // 8) * num_pixels * num_counters
-        if depth == 16:
-            buf16 = cast(buf, POINTER(c_uint16))
-            count = size_bytes // 2
-            data = np.ctypeslib.as_array(buf16, shape=(count,))
-        else:
-            count = size_bytes
-            data = np.ctypeslib.as_array(buf, shape=(count,))
+        # SDK expects a buffer of at least 4kB. The vendor wrapper uses
+        # row_size * _num_rows (typically 32 * 64 = 2048) elements.
+        row_size = int(getattr(self._spc, "row_size", 32) or 32)
+        num_rows_raw = int(getattr(self._spc, "_num_rows", 64) or 64)
+        buf_len = row_size * num_rows_raw
 
-        # Keep vendor object internally consistent for any later calls.
-        try:
-            self._spc._data_bits = depth
-        except Exception:
-            pass
+        # The C signature is effectively:
+        #   int SPC3_Get_Img_Position(void* h, uint16_t* Img, uint32_t pos, uint16_t counter)
+        # Use uint16 for compatibility (also works for 8-bit mode; values are truncated).
+        f = self._spc.dll.SPC3_Get_Img_Position
+        f.argtypes = [
+            c_void_p,
+            np.ctypeslib.ndpointer(dtype=np.uint16, ndim=1, flags="C_CONTIGUOUS"),
+            c_uint32,
+            c_uint16,
+        ]
+        f.restype = c_int
 
-        frames = SPC3.BufferToFrames(data, num_pixels, num_counters)
-        return np.array(frames, copy=True)
+        frames_out = np.empty(
+            (num_counters, num_frames, self._NROWS, self._ncols), dtype=np.uint16
+        )
+
+        for counter_idx in range(1, num_counters + 1):
+            for frame_idx in range(1, num_frames + 1):
+                data = np.zeros(buf_len, dtype=np.uint16)
+                ec = f(self._spc.c_handle, data, frame_idx, counter_idx)
+                self._spc._checkError(ec)
+
+                # BufferToFrames may see padding (e.g. Half_array) and interpret
+                # the raw buffer as multiple frames. We always take the first.
+                reshaped = SPC3.BufferToFrames(data, num_pixels, 1)
+                img2d = np.asarray(reshaped)[0, 0]
+                frames_out[counter_idx - 1, frame_idx - 1] = img2d
+
+        return frames_out
 
     def stop_acquisition(self):
         """Stop live or single acquisition."""
@@ -606,6 +603,44 @@ class SPC3_Qudi(CameraInterface):
         """Return current NIntegFrames value."""
         return self._NIntegFrames
 
+    # ── Snap frames (NFrames) ─────────────────────────────────────────
+
+    def get_snap_frames(self):
+        """Return the number of frames captured per snap acquisition (1-65534)."""
+        try:
+            return int(self._NFrames)
+        except Exception:
+            return 1
+
+    def set_snap_frames(self, n_frames):
+        """Set the number of frames per snap acquisition (NFrames).
+
+        This updates the camera parameters via SetCameraPar and commits the
+        settings. The change is only allowed while the camera is idle.
+
+        @param int n_frames: 1..65534
+        @return bool: Success
+        """
+        if not self.get_ready_state():
+            self.log.error(
+                "Cannot set snap frames while acquisition is active (live/snap/continuous)"
+            )
+            return False
+
+        try:
+            n = max(1, min(int(n_frames), 65534))
+        except Exception:
+            self.log.error(f"Invalid n_frames value: {n_frames!r}")
+            return False
+
+        if n == int(getattr(self, "_NFrames", 1) or 1):
+            return True
+
+        self._NFrames = n
+        self._apply_camera_settings()
+        self.log.info(f"Snap frames (NFrames) set to {self._NFrames}")
+        return True
+
     # ── Save directory ─────────────────────────────────────────────────
 
     def get_default_save_directory(self):
@@ -676,6 +711,24 @@ class SPC3_Qudi(CameraInterface):
             self._cont_filename = filename
             self.log.info(f"ContAcqToFileStart -> {filename}")
 
+            # Snap-like messaging for triggered continuous acquisition.
+            self._cont_waiting_for_trigger = False
+            if self._trigger_mode in ("single_trigger", "multiple_trigger"):
+                self._cont_waiting_for_trigger = True
+                extra = ""
+                if self._trigger_mode == "multiple_trigger":
+                    extra = f", frames_per_pulse={self._trigger_frames_per_pulse}"
+                self.log.info(
+                    f"Waiting for external trigger ({self._trigger_mode}{extra})..."
+                )
+                # If a trigger already happened, report immediately.
+                try:
+                    if self._is_triggered():
+                        self.log.info("Trigger received")
+                        self._cont_waiting_for_trigger = False
+                except Exception:
+                    pass
+
             # Best-effort: patch the output header early so even an interrupted
             # run preserves the gate metadata in the file header.
             try:
@@ -717,6 +770,7 @@ class SPC3_Qudi(CameraInterface):
             except Exception:
                 pass
             self._continuous = False
+            self._cont_waiting_for_trigger = False
         return True
 
     def get_continuous_memory(self):
@@ -725,6 +779,14 @@ class SPC3_Qudi(CameraInterface):
         @return int: bytes read in this call
         """
         if self._continuous:
+            # Log trigger receipt once when running in triggered modes.
+            if getattr(self, "_cont_waiting_for_trigger", False):
+                try:
+                    if self._is_triggered():
+                        self.log.info("Trigger received")
+                        self._cont_waiting_for_trigger = False
+                except Exception:
+                    pass
             return self._spc.ContAcqToFileGetMemory()
         return 0
 
@@ -1091,5 +1153,6 @@ class SPC3_Qudi(CameraInterface):
         SetCameraPar resets the SDK pending-settings queue, so the gate
         configuration must be re-issued before every ApplySettings() call.
         """
+        self._apply_trigger_settings()
         self._apply_gate_settings()
         self._spc.ApplySettings()

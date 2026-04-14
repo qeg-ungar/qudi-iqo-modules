@@ -123,6 +123,43 @@ class CameraLogic(LogicBase):
             self._gain = self._camera().get_gain()
             return self._gain
 
+    # ── SPC3 snap-frame count (NFrames) ──────────────────────────────
+
+    def get_snap_frames(self):
+        """Return the number of frames per snap acquisition, if supported."""
+        with self._thread_lock:
+            camera = self._camera()
+            getter = getattr(camera, "get_snap_frames", None)
+            if callable(getter):
+                try:
+                    return int(getter())
+                except Exception:
+                    pass
+            try:
+                return int(getattr(camera, "_NFrames", 1) or 1)
+            except Exception:
+                return 1
+
+    def set_snap_frames(self, n_frames):
+        """Set the number of frames per snap acquisition, if supported."""
+        with self._thread_lock:
+            if self.module_state() != "idle":
+                self.log.error(
+                    "Unable to set snap frames. Acquisition still in progress."
+                )
+                return False
+
+            camera = self._camera()
+            setter = getattr(camera, "set_snap_frames", None)
+            if not callable(setter):
+                self.log.error("Connected camera does not support set_snap_frames")
+                return False
+            try:
+                return bool(setter(n_frames))
+            except Exception as e:
+                self.log.error(f"Failed to set snap frames: {type(e).__name__}: {e}")
+                return False
+
     def capture_frame(self):
         """"""
         with self._thread_lock:

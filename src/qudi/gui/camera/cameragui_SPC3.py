@@ -67,7 +67,7 @@ class CameraMainWindow(QtWidgets.QMainWindow):
         self.action_start_video = QtWidgets.QAction("Start Video")
         self.action_start_video.setCheckable(True)
         toolbar.addAction(self.action_start_video)
-        self.action_capture_frame = QtWidgets.QAction("Capture Frame")
+        self.action_capture_frame = QtWidgets.QAction("Snap")
         self.action_capture_frame.setCheckable(True)
         toolbar.addAction(self.action_capture_frame)
 
@@ -75,12 +75,26 @@ class CameraMainWindow(QtWidgets.QMainWindow):
         self.action_continuous.setCheckable(True)
         toolbar.addAction(self.action_continuous)
 
+        # SPC3: snap frame count control (NFrames)
+        self.snap_frames_label = QtWidgets.QLabel("Snap Frames")
+        self.snap_frames_spinbox = QtWidgets.QSpinBox()
+        self.snap_frames_spinbox.setRange(1, 65534)
+        self.snap_frames_spinbox.setValue(1)
+        self.snap_frames_spinbox.setEnabled(False)
+        self.snap_frames_label.setEnabled(False)
+        self.snap_frames_spinbox.setToolTip(
+            "Number of frames acquired per Snap (SPC3 only)"
+        )
+
         # Snap frame browsing controls (enabled only for multi-frame snaps)
         self.snap_frame_label = QtWidgets.QLabel("Frame")
         self.snap_frame_spinbox = QtWidgets.QSpinBox()
         self.snap_frame_spinbox.setRange(0, 0)
         self.snap_frame_spinbox.setEnabled(False)
         self.snap_frame_label.setEnabled(False)
+        toolbar.addSeparator()
+        toolbar.addWidget(self.snap_frames_label)
+        toolbar.addWidget(self.snap_frames_spinbox)
         toolbar.addSeparator()
         toolbar.addWidget(self.snap_frame_label)
         toolbar.addWidget(self.snap_frame_spinbox)
@@ -109,6 +123,7 @@ class CameraGui(GuiBase):
         self._pending_snap_save_prompt = False
         self._snap_sequence = None
         self._continuous_active = False
+        self._supports_snap_frames = False
 
     def on_activate(self):
         """Initializes all needed UI files and establishes the connectors."""
@@ -141,6 +156,7 @@ class CameraGui(GuiBase):
         self._mw.action_save_frame.triggered.connect(self._save_frame)
         self._mw.snap_frame_spinbox.valueChanged.connect(self._snap_frame_index_changed)
         self._mw.action_continuous.triggered[bool].connect(self._continuous_clicked)
+        self._mw.snap_frames_spinbox.valueChanged.connect(self._snap_frames_changed)
 
         # connect update signals from logic
         logic.sigFrameChanged.connect(self._update_frame)
@@ -160,6 +176,7 @@ class CameraGui(GuiBase):
 
         # Initial state
         self._continuous_state_changed(bool(getattr(logic, "continuous_active", False)))
+        self._init_snap_frames_control()
         self.show()
 
     def on_deactivate(self):
@@ -185,6 +202,7 @@ class CameraGui(GuiBase):
         self._mw.action_start_video.triggered.disconnect()
         self._mw.action_continuous.triggered.disconnect()
         self._mw.snap_frame_spinbox.valueChanged.disconnect()
+        self._mw.snap_frames_spinbox.valueChanged.disconnect()
         self._mw.close()
 
     def show(self):
@@ -212,6 +230,7 @@ class CameraGui(GuiBase):
         self._mw.action_capture_frame.setDisabled(True)
         self._mw.action_continuous.setDisabled(True)
         self._mw.action_show_settings.setDisabled(True)
+        self._set_snap_frames_control_enabled(False)
         self._pending_snap_save_prompt = True
         self.sigCaptureFrameTriggered.emit()
 
@@ -223,6 +242,11 @@ class CameraGui(GuiBase):
         self._mw.action_show_settings.setEnabled(True)
         if not self._continuous_active:
             self._mw.action_continuous.setEnabled(True)
+
+        self._set_snap_frames_control_enabled(
+            self._supports_snap_frames
+            and (self._camera_logic().module_state() == "idle")
+        )
 
         # If this snap produced a multi-frame sequence, enable browsing.
         self._refresh_snap_sequence()
@@ -247,11 +271,17 @@ class CameraGui(GuiBase):
             self._mw.action_continuous.setDisabled(True)
             self._mw.action_start_video.setText("Stop Video")
 
+            self._set_snap_frames_control_enabled(False)
+
             # Video/live mode overrides snap browsing.
             self._set_snap_browsing_enabled(False)
         else:
             self._mw.action_start_video.setText("Start Video")
             self._mw.action_continuous.setEnabled(True)
+            self._set_snap_frames_control_enabled(
+                self._supports_snap_frames
+                and (self._camera_logic().module_state() == "idle")
+            )
         self.sigStartStopVideoToggled.emit(checked)
 
     def _continuous_clicked(self, checked):
@@ -272,12 +302,107 @@ class CameraGui(GuiBase):
             self._mw.action_capture_frame.setDisabled(True)
             self._mw.action_show_settings.setDisabled(True)
             self._set_snap_browsing_enabled(False)
+            self._set_snap_frames_control_enabled(False)
         else:
             self._mw.action_continuous.setText("Continuous")
             self._mw.action_start_video.setEnabled(True)
             self._mw.action_capture_frame.setEnabled(True)
             self._mw.action_show_settings.setEnabled(True)
             self._mw.action_continuous.setEnabled(True)
+            self._set_snap_frames_control_enabled(
+                self._supports_snap_frames
+                and (self._camera_logic().module_state() == "idle")
+            )
+
+    def _set_snap_frames_control_enabled(self, enabled: bool):
+        enabled = bool(enabled)
+        self._mw.snap_frames_label.setEnabled(enabled)
+        self._mw.snap_frames_spinbox.setEnabled(enabled)
+
+    def _init_snap_frames_control(self):
+        """Enable and initialize the Snap Frames control if the camera supports it."""
+        logic = self._camera_logic()
+
+        camera = getattr(logic, "_camera", None)
+        camera = camera() if callable(camera) else None
+
+        getter = getattr(logic, "get_snap_frames", None)
+        setter = getattr(logic, "set_snap_frames", None)
+        if callable(getter) and callable(setter):
+            self._supports_snap_frames = True
+            try:
+                n = int(getter())
+            except Exception:
+                n = 1
+            self._mw.snap_frames_spinbox.blockSignals(True)
+            try:
+                self._mw.snap_frames_spinbox.setValue(max(1, min(int(n), 65534)))
+            finally:
+                self._mw.snap_frames_spinbox.blockSignals(False)
+
+            self._set_snap_frames_control_enabled(
+                (not self._continuous_active) and (logic.module_state() == "idle")
+            )
+            return
+
+        # Fallback: hardware supports API directly (older logic variants)
+        cam_get = getattr(camera, "get_snap_frames", None)
+        cam_set = getattr(camera, "set_snap_frames", None)
+        if camera is not None and callable(cam_get) and callable(cam_set):
+            self._supports_snap_frames = True
+            try:
+                n = int(cam_get())
+            except Exception:
+                n = 1
+            self._mw.snap_frames_spinbox.blockSignals(True)
+            try:
+                self._mw.snap_frames_spinbox.setValue(max(1, min(int(n), 65534)))
+            finally:
+                self._mw.snap_frames_spinbox.blockSignals(False)
+
+            self._set_snap_frames_control_enabled(
+                (not self._continuous_active) and (logic.module_state() == "idle")
+            )
+            return
+
+        self._supports_snap_frames = False
+        self._set_snap_frames_control_enabled(False)
+
+    def _snap_frames_changed(self, value):
+        """Apply snap frame count to SPC3 hardware/logic."""
+        if not self._supports_snap_frames:
+            return
+
+        logic = self._camera_logic()
+        if logic.module_state() != "idle":
+            # Revert to current value (best-effort).
+            try:
+                current = int(getattr(logic, "get_snap_frames")())
+            except Exception:
+                current = int(value)
+            self._mw.snap_frames_spinbox.blockSignals(True)
+            try:
+                self._mw.snap_frames_spinbox.setValue(current)
+            finally:
+                self._mw.snap_frames_spinbox.blockSignals(False)
+            return
+
+        setter = getattr(logic, "set_snap_frames", None)
+        if callable(setter):
+            ok = bool(setter(int(value)))
+            if not ok:
+                self._init_snap_frames_control()
+            return
+
+        # Fallback: set directly on hardware
+        camera = getattr(logic, "_camera", None)
+        camera = camera() if callable(camera) else None
+        cam_set = getattr(camera, "set_snap_frames", None)
+        if callable(cam_set):
+            ok = bool(cam_set(int(value)))
+            if not ok:
+                self._init_snap_frames_control()
+            return
 
     def _update_frame(self, frame_data):
         self._mw.image_widget.set_image(frame_data)
