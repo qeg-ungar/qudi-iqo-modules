@@ -489,6 +489,7 @@ class SpadOptimizeLogic(LogicBase):
                 ok = camera.start_single_acquisition()
                 if ok:
                     avg_frame = None
+                    used_snap_stack = False
 
                     # CameraInterface.start_single_acquisition() returns a bool.
                     # The SPC3 hardware module caches the snap stack and exposes
@@ -504,8 +505,10 @@ class SpadOptimizeLogic(LogicBase):
                             snap_stack = np.asarray(snap_stack)
                             if snap_stack.ndim == 3:
                                 avg_frame = snap_stack.mean(axis=0)
+                                used_snap_stack = True
                             elif snap_stack.ndim == 2:
                                 avg_frame = snap_stack
+                                used_snap_stack = True
 
                     # Fallback: use the standard interface method (2-D frame).
                     if avg_frame is None:
@@ -514,6 +517,65 @@ class SpadOptimizeLogic(LogicBase):
                     # Ensure 2-D
                     if avg_frame is not None and avg_frame.ndim != 2:
                         avg_frame = np.squeeze(avg_frame)
+
+                    # Convert to counts if we had to fall back to get_acquired_data()
+                    # and the camera is configured to return cps.
+                    if (avg_frame is not None) and (not used_snap_stack):
+                        try:
+                            get_units = getattr(camera, "get_display_units", None)
+                            units = str(get_units()) if callable(get_units) else None
+                        except Exception:
+                            units = None
+                        if units == "cps":
+                            try:
+                                exp_s = float(camera.get_exposure() or 0.0)
+                            except Exception:
+                                exp_s = 0.0
+                            if exp_s > 0:
+                                avg_frame = np.asarray(avg_frame) * exp_s
+
+                    # Apply background subtraction (counts-domain) if available.
+                    try:
+                        get_bg = getattr(
+                            camera, "get_background_subtraction_counts", None
+                        )
+                        if callable(get_bg):
+                            bg_enabled, bg_counts = get_bg()
+                        else:
+                            bg_enabled, bg_counts = False, None
+                    except Exception:
+                        bg_enabled, bg_counts = False, None
+
+                    if (
+                        bg_enabled
+                        and (bg_counts is not None)
+                        and (avg_frame is not None)
+                    ):
+                        try:
+                            arr = np.asarray(avg_frame)
+                            bg = np.asarray(bg_counts)
+
+                            if arr.shape != bg.shape:
+                                bg_t = None
+                                try:
+                                    bg_t = bg.T
+                                except Exception:
+                                    bg_t = None
+                                if bg_t is not None and arr.shape == bg_t.shape:
+                                    bg = bg_t
+                                else:
+                                    self.log.debug(
+                                        "Skipping background subtraction (shape mismatch): "
+                                        f"frame={arr.shape}, bg={bg.shape}"
+                                    )
+                                    bg = None
+
+                            if bg is not None:
+                                out = arr.astype(np.float32, copy=False) - bg
+                                avg_frame = np.clip(out, 0, None)
+                        except Exception:
+                            # Never block the sweep due to subtraction.
+                            pass
 
                     self._current_step_frames.append(avg_frame)
                 else:

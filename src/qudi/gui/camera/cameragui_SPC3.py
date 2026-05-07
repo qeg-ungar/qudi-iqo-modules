@@ -24,6 +24,8 @@ Notes
 import os
 import datetime
 
+import numpy as np
+
 from PySide2 import QtCore, QtWidgets, QtGui
 
 from qudi.core.module import GuiBase
@@ -44,6 +46,17 @@ class CameraMainWindow(QtWidgets.QMainWindow):
         # Create menu bar
         menu_bar = QtWidgets.QMenuBar()
         menu = menu_bar.addMenu("File")
+
+        self.action_load_spc3 = QtWidgets.QAction("Load SPC3...")
+        try:
+            path = os.path.join(get_artwork_dir(), "icons", "document-open")
+            if os.path.exists(path):
+                self.action_load_spc3.setIcon(QtGui.QIcon(path))
+        except Exception:
+            pass
+        menu.addAction(self.action_load_spc3)
+
+        menu.addSeparator()
         self.action_save_frame = QtWidgets.QAction("Save Frame")
         path = os.path.join(get_artwork_dir(), "icons", "document-save")
         self.action_save_frame.setIcon(QtGui.QIcon(path))
@@ -74,6 +87,13 @@ class CameraMainWindow(QtWidgets.QMainWindow):
         self.action_continuous = QtWidgets.QAction("Continuous")
         self.action_continuous.setCheckable(True)
         toolbar.addAction(self.action_continuous)
+
+        self.action_background_subtraction = QtWidgets.QAction("Background Subtraction")
+        self.action_background_subtraction.setCheckable(True)
+        self.action_background_subtraction.setToolTip(
+            "Subtract an averaged SPC3 background image from live video frames"
+        )
+        toolbar.addAction(self.action_background_subtraction)
 
         # SPC3: snap frame count control (NFrames)
         self.snap_frames_label = QtWidgets.QLabel("Snap Frames")
@@ -122,6 +142,15 @@ class CameraGui(GuiBase):
         self._settings_dialog = None
         self._pending_snap_save_prompt = False
         self._snap_sequence = None
+        self._loaded_spc3_filepath = None
+        self._loaded_spc3_header = None
+        self._last_spc3_open_dir = None
+
+        self._bg_sub_enabled = False
+        self._bg_sub_filepath = None
+        self._bg_image = None
+        self._bg_image_counts = None
+        self._bg_sub_warned = False
         self._continuous_active = False
         self._supports_snap_frames = False
 
@@ -154,6 +183,10 @@ class CameraGui(GuiBase):
             lambda: self._settings_dialog.exec_()
         )
         self._mw.action_save_frame.triggered.connect(self._save_frame)
+        self._mw.action_load_spc3.triggered.connect(self._load_spc3_clicked)
+        self._mw.action_background_subtraction.triggered[bool].connect(
+            self._background_subtraction_toggled
+        )
         self._mw.snap_frame_spinbox.valueChanged.connect(self._snap_frame_index_changed)
         self._mw.action_continuous.triggered[bool].connect(self._continuous_clicked)
         self._mw.snap_frames_spinbox.valueChanged.connect(self._snap_frames_changed)
@@ -197,6 +230,8 @@ class CameraGui(GuiBase):
                 pass
 
         self._mw.action_save_frame.triggered.disconnect()
+        self._mw.action_load_spc3.triggered.disconnect()
+        self._mw.action_background_subtraction.triggered.disconnect()
         self._mw.action_show_settings.triggered.disconnect()
         self._mw.action_capture_frame.triggered.disconnect()
         self._mw.action_start_video.triggered.disconnect()
@@ -405,7 +440,230 @@ class CameraGui(GuiBase):
             return
 
     def _update_frame(self, frame_data):
+        if (
+            self._bg_sub_enabled
+            and self._mw.action_start_video.isChecked()
+            and (frame_data is not None)
+            and (self._bg_image is not None)
+        ):
+            try:
+                arr = np.asarray(frame_data)
+                bg = self._bg_image
+
+                # If shapes don't match, attempt a simple transpose auto-fix.
+                if arr.shape != bg.shape:
+                    try:
+                        bg_t = np.asarray(bg).T
+                    except Exception:
+                        bg_t = None
+                    if bg_t is not None and arr.shape == bg_t.shape:
+                        bg = bg_t
+                        self._bg_image = bg_t
+                    else:
+                        if not self._bg_sub_warned:
+                            self._bg_sub_warned = True
+                            self.log.warning(
+                                "Background subtraction skipped (shape mismatch): "
+                                f"frame={arr.shape}, bg={self._bg_image.shape}"
+                            )
+                        self._mw.image_widget.set_image(frame_data)
+                        return
+
+                out = arr.astype(np.float32, copy=False) - bg
+                out = np.clip(out, 0, None)
+
+                self._mw.image_widget.set_image(out)
+                return
+            except Exception as e:
+                # Best-effort: never auto-disable based on a single bad frame.
+                if not self._bg_sub_warned:
+                    self._bg_sub_warned = True
+                    self.log.warning(
+                        "Background subtraction skipped for this frame: "
+                        f"{type(e).__name__}: {e}"
+                    )
+                self._mw.image_widget.set_image(frame_data)
+                return
+
         self._mw.image_widget.set_image(frame_data)
+
+    def _set_background_subtraction_enabled(self, enabled: bool):
+        enabled = bool(enabled)
+        self._bg_sub_enabled = enabled
+
+        # Also propagate to logic so snap acquisitions (capture_frame) can apply it.
+        try:
+            logic = self._camera_logic()
+            setter = getattr(logic, "set_background_subtraction", None)
+            if callable(setter):
+                if enabled:
+                    setter(True, self._bg_image)
+                else:
+                    setter(False, None)
+        except Exception:
+            # GUI-side subtraction (live video) should still work even if the
+            # logic doesn't implement or accept this hook.
+            pass
+
+        # Also propagate a counts-domain background image to the hardware so
+        # other modules that talk to the camera directly (e.g. spad_optimize_logic)
+        # can apply subtraction consistently.
+        try:
+            logic = self._camera_logic()
+            camera = getattr(logic, "_camera", None)
+            camera = camera() if callable(camera) else None
+            cam_set = getattr(camera, "set_background_subtraction_counts", None)
+            if callable(cam_set):
+                if enabled:
+                    cam_set(True, self._bg_image_counts)
+                else:
+                    cam_set(False, None)
+        except Exception:
+            pass
+
+        self._mw.action_background_subtraction.blockSignals(True)
+        try:
+            self._mw.action_background_subtraction.setChecked(enabled)
+        finally:
+            self._mw.action_background_subtraction.blockSignals(False)
+
+        if not enabled:
+            self._bg_sub_filepath = None
+            self._bg_image = None
+            self._bg_image_counts = None
+            self._bg_sub_warned = False
+
+    def _background_subtraction_toggled(self, checked: bool):
+        checked = bool(checked)
+        if not checked:
+            self._set_background_subtraction_enabled(False)
+            return
+
+        start_dir = self._last_spc3_open_dir
+        if not start_dir:
+            logic = self._camera_logic()
+            camera = getattr(logic, "_camera", None)
+            camera = camera() if callable(camera) else None
+            get_dir = getattr(camera, "get_default_save_directory", None)
+            if callable(get_dir):
+                try:
+                    start_dir = (get_dir() or "").strip() or None
+                except Exception:
+                    start_dir = None
+        if not start_dir:
+            start_dir = self.module_default_data_dir
+
+        path, _ = QtWidgets.QFileDialog.getOpenFileName(
+            self._mw,
+            "Select Background SPC3 File",
+            start_dir,
+            "SPC3 Files (*.spc3);;All Files (*)",
+        )
+        if not path:
+            self._set_background_subtraction_enabled(False)
+            return
+
+        path = os.path.normpath(str(path))
+        self._last_spc3_open_dir = os.path.dirname(path)
+
+        try:
+            from qudi.hardware.camera.SPC3.spc import SPC3
+
+            frames, _header = SPC3.ReadSPC3DataFile(path)
+
+            if getattr(frames, "ndim", 0) == 4:
+                seq = np.asarray(frames)[0]
+            elif getattr(frames, "ndim", 0) == 3:
+                seq = np.asarray(frames)
+            elif getattr(frames, "ndim", 0) == 2:
+                seq = np.asarray(frames)[None, ...]
+            else:
+                raise ValueError(
+                    f"Unexpected frames array ndim={getattr(frames, 'ndim', None)}"
+                )
+
+            if seq.shape[0] < 1:
+                raise ValueError("No frames found in background file")
+
+            bg_counts = seq.astype(np.float32).mean(axis=0)
+            if bg_counts.ndim != 2:
+                raise ValueError(f"Unexpected background image ndim={bg_counts.ndim}")
+
+            # Match background units to whatever the live frame display uses.
+            logic = self._camera_logic()
+            camera = getattr(logic, "_camera", None)
+            camera = camera() if callable(camera) else None
+
+            display_units = None
+            if camera is not None:
+                get_units = getattr(camera, "get_display_units", None)
+                if callable(get_units):
+                    try:
+                        display_units = str(get_units())
+                    except Exception:
+                        display_units = None
+
+            # Exposure time encoded in the SPC3 file header (best-effort).
+            bg_exp_s = None
+            try:
+                hw_int = float(getattr(_header, "HwIntTime", 0.0) or 0.0)
+                summed = float(getattr(_header, "SummedFrames", 1.0) or 1.0)
+                if hw_int > 0 and summed > 0:
+                    bg_exp_s = hw_int * summed
+            except Exception:
+                bg_exp_s = None
+
+            # Current exposure of the connected camera (best-effort).
+            cur_exp_s = None
+            try:
+                if camera is not None:
+                    get_exp = getattr(camera, "get_exposure", None)
+                    if callable(get_exp):
+                        cur_exp_s = float(get_exp() or 0.0)
+            except Exception:
+                cur_exp_s = None
+
+            # Counts-domain background scaled to current exposure (for snap stacks).
+            bg_counts_scaled = bg_counts
+            if bg_exp_s and cur_exp_s and bg_exp_s > 0 and cur_exp_s > 0:
+                bg_counts_scaled = bg_counts * (cur_exp_s / bg_exp_s)
+
+            bg = bg_counts
+            if display_units == "cps":
+                if bg_exp_s and bg_exp_s > 0:
+                    bg = bg_counts / float(bg_exp_s)
+                else:
+                    self.log.warning(
+                        "Background file has no valid exposure in header; "
+                        "background will be treated as cps but may be mis-scaled."
+                    )
+            elif display_units == "counts":
+                # If the live display is in raw counts, scale the background to the
+                # current exposure so subtraction is meaningful across mismatched files.
+                bg = bg_counts_scaled
+
+            self.log.info(
+                "Background loaded for subtraction: "
+                f"path={path}, n_frames={int(seq.shape[0])}, shape={tuple(bg.shape)}, "
+                f"display_units={display_units or 'unknown'}, bg_exp_s={bg_exp_s}"
+            )
+
+        except Exception as e:
+            QtWidgets.QMessageBox.warning(
+                self._mw,
+                "Background Subtraction",
+                f"Failed to load background SPC3 file:\n{path}\n\n{type(e).__name__}: {e}",
+            )
+            self._set_background_subtraction_enabled(False)
+            return
+
+        self._bg_sub_filepath = path
+        self._bg_image = bg
+        self._bg_image_counts = bg_counts_scaled
+        self._bg_sub_warned = False
+        self._set_background_subtraction_enabled(True)
+
+        self.log.info(f"Background subtraction enabled. File: {path}")
 
     def _set_snap_browsing_enabled(self, enabled, n_frames=0):
         enabled = bool(enabled) and int(n_frames) > 1
@@ -444,6 +702,11 @@ class CameraGui(GuiBase):
             return
 
         self._snap_sequence = seq
+
+        # We're now showing a hardware snap sequence (not a loaded file).
+        self._loaded_spc3_filepath = None
+        self._loaded_spc3_header = None
+
         self._set_snap_browsing_enabled(True, n_frames=n_frames)
 
         # Default to the last frame (what the logic already shows).
@@ -463,50 +726,311 @@ class CameraGui(GuiBase):
             frame = self._snap_sequence[idx]
         except Exception:
             return
-        self._update_frame(frame)
+
+        # Snap browsing frames come straight from the hardware snap stack and are
+        # raw counts. For a consistent display (and correct background subtraction),
+        # scale to match the camera display units before rendering.
+        logic = self._camera_logic()
+        camera = getattr(logic, "_camera", None)
+        camera = camera() if callable(camera) else None
+
+        display_units = None
+        if camera is not None:
+            get_units = getattr(camera, "get_display_units", None)
+            if callable(get_units):
+                try:
+                    display_units = str(get_units())
+                except Exception:
+                    display_units = None
+
+        out = frame
+        if display_units == "cps":
+            exp_s = None
+            try:
+                exp_s = float(logic.get_exposure() or 0.0)
+            except Exception:
+                exp_s = None
+            if exp_s and exp_s > 0:
+                out = np.asarray(frame).astype(np.float64, copy=False) / float(exp_s)
+
+        # Apply background subtraction for snap browsing (independent of live video).
+        if self._bg_sub_enabled and (out is not None) and (self._bg_image is not None):
+            try:
+                arr = np.asarray(out)
+                bg = self._bg_image
+
+                if arr.shape != bg.shape:
+                    bg_t = None
+                    try:
+                        bg_t = np.asarray(bg).T
+                    except Exception:
+                        bg_t = None
+                    if bg_t is not None and arr.shape == bg_t.shape:
+                        bg = bg_t
+                        self._bg_image = bg_t
+                    else:
+                        if not self._bg_sub_warned:
+                            self._bg_sub_warned = True
+                            self.log.warning(
+                                "Background subtraction skipped (shape mismatch): "
+                                f"frame={arr.shape}, bg={self._bg_image.shape}"
+                            )
+                        self._mw.image_widget.set_image(out)
+                        return
+
+                arr_f = arr.astype(np.float32, copy=False)
+                out_sub = arr_f - bg
+                out_sub = np.clip(out_sub, 0, None)
+                self._mw.image_widget.set_image(out_sub)
+                return
+            except Exception as e:
+                if not self._bg_sub_warned:
+                    self._bg_sub_warned = True
+                    self.log.warning(
+                        "Background subtraction skipped for this frame: "
+                        f"{type(e).__name__}: {e}"
+                    )
+
+        self._mw.image_widget.set_image(out)
+
+    def _load_spc3_clicked(self):
+        """Load an SPC3 acquisition file from disk and enable frame browsing."""
+        start_dir = self._last_spc3_open_dir
+        if not start_dir:
+            logic = self._camera_logic()
+            camera = getattr(logic, "_camera", None)
+            camera = camera() if callable(camera) else None
+            get_dir = getattr(camera, "get_default_save_directory", None)
+            if callable(get_dir):
+                try:
+                    start_dir = (get_dir() or "").strip() or None
+                except Exception:
+                    start_dir = None
+        if not start_dir:
+            start_dir = self.module_default_data_dir
+
+        path, _ = QtWidgets.QFileDialog.getOpenFileName(
+            self._mw,
+            "Open SPC3 File",
+            start_dir,
+            "SPC3 Files (*.spc3);;All Files (*)",
+        )
+        if not path:
+            return
+
+        self._last_spc3_open_dir = os.path.dirname(path)
+        self._load_spc3_file(path)
+
+    def _load_spc3_file(self, filepath: str):
+        filepath = os.path.normpath(str(filepath))
+        if not os.path.exists(filepath):
+            QtWidgets.QMessageBox.warning(
+                self._mw,
+                "Load Error",
+                f"File not found:\n{filepath}",
+            )
+            return
+
+        try:
+            from qudi.hardware.camera.SPC3.spc import SPC3
+
+            frames, header = SPC3.ReadSPC3DataFile(filepath)
+        except Exception as e:
+            QtWidgets.QMessageBox.warning(
+                self._mw,
+                "Load Error",
+                f"Failed to load SPC3 file:\n{filepath}\n\n{type(e).__name__}: {e}",
+            )
+            return
+
+        try:
+            # ReadSPC3DataFile returns (counters, frames, rows, cols) in the common case.
+            if getattr(frames, "ndim", 0) == 4:
+                seq = frames[0]
+            elif getattr(frames, "ndim", 0) == 3:
+                seq = frames
+            elif getattr(frames, "ndim", 0) == 2:
+                seq = frames[None, ...]
+            else:
+                raise ValueError(
+                    f"Unexpected frames array ndim={getattr(frames, 'ndim', None)}"
+                )
+
+            n_frames = int(seq.shape[0])
+            if n_frames < 1:
+                raise ValueError("No frames found in file")
+        except Exception as e:
+            QtWidgets.QMessageBox.warning(
+                self._mw,
+                "Load Error",
+                f"SPC3 file content is not understood:\n{filepath}\n\n{type(e).__name__}: {e}",
+            )
+            return
+
+        self._loaded_spc3_filepath = filepath
+        self._loaded_spc3_header = header
+
+        self._snap_sequence = seq
+        self._set_snap_browsing_enabled(True, n_frames=n_frames)
+
+        # Default to the last frame.
+        self._mw.snap_frame_spinbox.blockSignals(True)
+        try:
+            self._mw.snap_frame_spinbox.setValue(n_frames - 1)
+        finally:
+            self._mw.snap_frame_spinbox.blockSignals(False)
+
+        try:
+            self._update_frame(self._snap_sequence[n_frames - 1])
+        except Exception:
+            pass
 
     def _prompt_save_spc3_after_snap(self):
-        """Optionally save the most recent SPC3 snap buffer as a .spc3 file."""
+        """Optionally save the most recent SPC3 snap buffer as a .spc3 file and/or averaged image."""
         logic = self._camera_logic()
 
-        # Access camera directly (best-effort; this is a custom GUI).
         camera = getattr(logic, "_camera", None)
         camera = camera() if callable(camera) else None
 
         save_method = getattr(camera, "save_last_snap_to_file", None)
-        if camera is None or not callable(save_method):
-            # Not an SPC3 camera or hardware doesn’t support manual snap saving.
+        can_save_spc3 = camera is not None and callable(save_method)
+        can_save_avg = self._snap_sequence is not None
+
+        if not can_save_spc3 and not can_save_avg:
             return
 
-        reply = QtWidgets.QMessageBox.question(
-            self._mw,
-            "Snap Complete",
-            "Snap acquisition complete.\n\nWould you like to save the snap as a .spc3 file?",
-            QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
-            QtWidgets.QMessageBox.No,
+        # Build a dialog with checkboxes for both save options.
+        dlg = QtWidgets.QDialog(self._mw)
+        dlg.setWindowTitle("Snap Complete")
+        layout = QtWidgets.QVBoxLayout(dlg)
+        layout.addWidget(QtWidgets.QLabel("Snap acquisition complete.\n\nSelect what to save:"))
+
+        cb_spc3 = QtWidgets.QCheckBox("Save as .spc3 file")
+        cb_spc3.setChecked(can_save_spc3)
+        cb_spc3.setEnabled(can_save_spc3)
+        layout.addWidget(cb_spc3)
+
+        bg_suffix = " (with background subtraction)" if self._bg_sub_enabled else ""
+        cb_avg = QtWidgets.QCheckBox(f"Save averaged image{bg_suffix} (PNG + DAT)")
+        cb_avg.setChecked(can_save_avg)
+        cb_avg.setEnabled(can_save_avg)
+        layout.addWidget(cb_avg)
+
+        buttons = QtWidgets.QDialogButtonBox(
+            QtWidgets.QDialogButtonBox.Ok | QtWidgets.QDialogButtonBox.Cancel
         )
-        if reply != QtWidgets.QMessageBox.Yes:
+        buttons.accepted.connect(dlg.accept)
+        buttons.rejected.connect(dlg.reject)
+        layout.addWidget(buttons)
+
+        if dlg.exec_() != QtWidgets.QDialog.Accepted:
             return
 
-        directory = ""
-        get_dir = getattr(camera, "get_default_save_directory", None)
-        if callable(get_dir):
-            directory = (get_dir() or "").strip()
+        if can_save_spc3 and cb_spc3.isChecked():
+            directory = ""
+            get_dir = getattr(camera, "get_default_save_directory", None)
+            if callable(get_dir):
+                directory = (get_dir() or "").strip()
+            if not directory:
+                directory = self.module_default_data_dir
 
-        if not directory:
-            directory = self.module_default_data_dir
+            os.makedirs(directory, exist_ok=True)
+            ts = datetime.datetime.now().strftime("%Y%m%d-%H%M%S-%f")
+            stem = os.path.join(directory, f"spc3_snap_{ts}")
+            ok = bool(save_method(stem))
+            if not ok:
+                QtWidgets.QMessageBox.warning(
+                    self._mw,
+                    "Save Error",
+                    "Failed to save .spc3 file.\n\nCheck log for details.",
+                )
 
-        os.makedirs(directory, exist_ok=True)
+        if can_save_avg and cb_avg.isChecked():
+            self._save_snap_averaged_image()
 
-        ts = datetime.datetime.now().strftime("%Y%m%d-%H%M%S-%f")
-        stem = os.path.join(directory, f"spc3_snap_{ts}")
-        ok = bool(save_method(stem))
+    def _save_snap_averaged_image(self):
+        """Save the averaged snap image (PNG + DAT), mirroring the Save Frame logic."""
+        if self._snap_sequence is None:
+            self.log.error("No snap sequence available. Nothing to save.")
+            return
 
-        if not ok:
+        logic = self._camera_logic()
+        camera = getattr(logic, "_camera", None)
+        camera = camera() if callable(camera) else None
+
+        # Average raw counts over all frames.
+        avg = np.asarray(self._snap_sequence).astype(np.float64).mean(axis=0)
+
+        # Convert to display units (same as _snap_frame_index_changed).
+        display_units = None
+        if camera is not None:
+            get_units = getattr(camera, "get_display_units", None)
+            if callable(get_units):
+                try:
+                    display_units = str(get_units())
+                except Exception:
+                    display_units = None
+
+        if display_units == "cps":
+            exp_s = None
+            try:
+                exp_s = float(logic.get_exposure() or 0.0)
+            except Exception:
+                exp_s = None
+            if exp_s and exp_s > 0:
+                avg = avg / float(exp_s)
+
+        # Apply background subtraction (same logic as _snap_frame_index_changed).
+        if self._bg_sub_enabled and self._bg_image is not None:
+            try:
+                bg = self._bg_image
+                if avg.shape != bg.shape:
+                    bg_t = np.asarray(bg).T
+                    if avg.shape == bg_t.shape:
+                        bg = bg_t
+                        self._bg_image = bg_t
+                    else:
+                        self.log.warning(
+                            "Background subtraction skipped when saving averaged image "
+                            f"(shape mismatch): avg={avg.shape}, bg={self._bg_image.shape}"
+                        )
+                        bg = None
+                if bg is not None:
+                    avg = np.clip(avg - bg, 0, None)
+            except Exception as e:
+                self.log.warning(
+                    f"Background subtraction skipped when saving averaged image: "
+                    f"{type(e).__name__}: {e}"
+                )
+
+        try:
+            ds = TextDataStorage(root_dir=self.module_default_data_dir)
+            timestamp = datetime.datetime.now()
+            tag = logic.create_tag(timestamp)
+
+            parameters = {
+                "gain": logic.get_gain(),
+                "exposure": logic.get_exposure(),
+                "n_frames_averaged": int(self._snap_sequence.shape[0]),
+                "background_subtraction": self._bg_sub_enabled,
+            }
+
+            file_path, _, _ = ds.save_data(
+                avg,
+                metadata=parameters,
+                nametag=tag,
+                timestamp=timestamp,
+                column_headers="Averaged Image (columns is X, rows is Y)",
+            )
+            figure = logic.draw_2d_image(avg, cbar_range=None)
+            ds.save_thumbnail(figure, file_path=file_path.rsplit(".", 1)[0])
+            self.log.info(f"Averaged snap image saved to: {file_path}")
+        except Exception as e:
+            self.log.error(f"Failed to save averaged image: {type(e).__name__}: {e}")
             QtWidgets.QMessageBox.warning(
                 self._mw,
                 "Save Error",
-                "Failed to save .spc3 file.\n\nCheck log for details.",
+                f"Failed to save averaged image.\n\n{type(e).__name__}: {e}",
             )
 
     def _save_frame(self):

@@ -57,6 +57,76 @@ class CameraLogic(LogicBase):
         self._continuous_active = False
         self._continuous_filepath = ""
 
+        # Background subtraction (optional; typically enabled/configured by the GUI)
+        self._bg_sub_enabled = False
+        self._bg_image = None
+        self._bg_sub_warned = False
+
+    def set_background_subtraction(self, enabled: bool, bg_image=None):
+        """Enable/disable background subtraction for snap acquisitions.
+
+        If enabled, `bg_image` should be a 2D array in the same units as
+        `camera.get_acquired_data()` returns (e.g. counts or cps).
+        """
+        with self._thread_lock:
+            enabled = bool(enabled)
+            if not enabled:
+                self._bg_sub_enabled = False
+                self._bg_image = None
+                self._bg_sub_warned = False
+                return
+
+            if bg_image is None:
+                self.log.error(
+                    "Background subtraction enable requested but no bg_image was provided"
+                )
+                self._bg_sub_enabled = False
+                self._bg_image = None
+                return
+
+            self._bg_image = np.asarray(bg_image)
+            self._bg_sub_enabled = True
+            self._bg_sub_warned = False
+
+    def _apply_background_subtraction(self, frame_data):
+        if not self._bg_sub_enabled or self._bg_image is None or frame_data is None:
+            return frame_data
+
+        try:
+            arr = np.asarray(frame_data)
+            bg = self._bg_image
+
+            # If shapes don't match, attempt a simple transpose auto-fix.
+            if arr.shape != bg.shape:
+                bg_t = None
+                try:
+                    bg_t = np.asarray(bg).T
+                except Exception:
+                    bg_t = None
+                if bg_t is not None and arr.shape == bg_t.shape:
+                    bg = bg_t
+                    self._bg_image = bg_t
+                else:
+                    if not self._bg_sub_warned:
+                        self._bg_sub_warned = True
+                        self.log.warning(
+                            "Background subtraction skipped (shape mismatch): "
+                            f"frame={arr.shape}, bg={self._bg_image.shape}"
+                        )
+                    return frame_data
+
+            out = arr.astype(np.float32, copy=False) - bg
+            out = np.clip(out, 0, None)
+            return out
+        except Exception as e:
+            if not self._bg_sub_warned:
+                self._bg_sub_warned = True
+                self.log.warning(
+                    "Background subtraction skipped for this frame: "
+                    f"{type(e).__name__}: {e}"
+                )
+            return frame_data
+
     def on_activate(self):
         """Initialisation performed during activation of the module."""
         camera = self._camera()
@@ -173,6 +243,7 @@ class CameraLogic(LogicBase):
                 camera = self._camera()
                 camera.start_single_acquisition()
                 self._last_frame = camera.get_acquired_data()
+                self._last_frame = self._apply_background_subtraction(self._last_frame)
                 self.module_state.unlock()
                 self.sigFrameChanged.emit(self._last_frame)
                 self.sigAcquisitionFinished.emit()

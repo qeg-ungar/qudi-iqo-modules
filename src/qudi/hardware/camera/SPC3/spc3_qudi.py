@@ -157,6 +157,10 @@ class SPC3_Qudi(CameraInterface):
         # ── Cached snap stack for browsing (counter, frame, row, col) ─
         self._last_snap_frames = None
 
+        # ── Background subtraction (counts-domain; optional) ─────────
+        self._bg_sub_enabled_counts = False
+        self._bg_counts_image = None
+
         # ── Loaded-file viewer state ───────────────────────────────────
         self._loaded_frames = None
         self._loaded_header = None
@@ -564,6 +568,47 @@ class SPC3_Qudi(CameraInterface):
         self._display_units = units
         self.log.info(f"Display units set to: {units}")
         return True
+
+    # ── Background subtraction (counts-domain) ───────────────────────
+
+    def set_background_subtraction_counts(self, enabled: bool, bg_counts_image=None):
+        """Enable/disable background subtraction for *raw counts* frames.
+
+        This stores a 2-D image in the same units as the snap stack returned by
+        `get_last_snap_sequence()` (counts). It does not automatically modify
+        the data returned by `get_acquired_data()`.
+        """
+        enabled = bool(enabled)
+        if not enabled:
+            self._bg_sub_enabled_counts = False
+            self._bg_counts_image = None
+            return True
+
+        if bg_counts_image is None:
+            self.log.error(
+                "Background subtraction enable requested but bg_counts_image is None"
+            )
+            self._bg_sub_enabled_counts = False
+            self._bg_counts_image = None
+            return False
+
+        try:
+            bg = np.asarray(bg_counts_image)
+            if bg.ndim != 2:
+                raise ValueError(f"bg_counts_image must be 2-D, got ndim={bg.ndim}")
+        except Exception as e:
+            self.log.error(f"Invalid bg_counts_image: {type(e).__name__}: {e}")
+            self._bg_sub_enabled_counts = False
+            self._bg_counts_image = None
+            return False
+
+        self._bg_counts_image = bg
+        self._bg_sub_enabled_counts = True
+        return True
+
+    def get_background_subtraction_counts(self):
+        """Return (enabled, bg_counts_image) for counts-domain subtraction."""
+        return bool(self._bg_sub_enabled_counts), self._bg_counts_image
 
     # ── Hardware integration time ──────────────────────────────────────
 
