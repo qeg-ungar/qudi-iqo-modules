@@ -102,6 +102,9 @@ class SPC3_Qudi(CameraInterface):
     _NROWS = 32  # Pixel array is always 32 rows
     _TRIGGER_WAIT_TIMEOUT_S = 60.0
     _LIVE_THROTTLE_S = 0.01
+    _GATE_PATCH_MAX_ATTEMPTS = 3
+    _GATE_PATCH_RETRY_S = 0.1
+    _CONT_PATCH_INTERVAL_S = 10.0  # Re-patch during acquisition to catch new split files
 
     # ══════════════════════════════════════════════════════════════════
     #  Module lifecycle
@@ -225,11 +228,7 @@ class SPC3_Qudi(CameraInterface):
             self._live = False
 
         if self._continuous:
-            try:
-                self._spc.ContAcqToFileStop()
-            except Exception:
-                pass
-            self._continuous = False
+            self.stop_continuous_acquisition()
 
         self._acquiring = False
 
@@ -754,7 +753,11 @@ class SPC3_Qudi(CameraInterface):
             self._spc.ContAcqToFileStart(filename)
             self._continuous = True
             self._cont_filename = filename
+            self._cont_last_patch_time = time.monotonic()
             self.log.info(f"ContAcqToFileStart -> {filename}")
+
+            # Stamp gate metadata immediately so the header is readable before stop.
+            self._patch_cont_files_inplace()
 
             # Snap-like messaging for triggered continuous acquisition.
             self._cont_waiting_for_trigger = False
@@ -774,19 +777,6 @@ class SPC3_Qudi(CameraInterface):
                 except Exception:
                     pass
 
-            # Best-effort: patch the output header early so even an interrupted
-            # run preserves the gate metadata in the file header.
-            try:
-                expected = filename + ".spc3"
-                if os.path.exists(expected):
-                    self._patch_spc3_coarse_gate_header(
-                        expected,
-                        gate_mode=getattr(self, "_cont_gate_mode", None),
-                        start_cycles=getattr(self, "_cont_coarse_gate_start", None),
-                        stop_cycles=getattr(self, "_cont_coarse_gate_stop", None),
-                    )
-            except Exception:
-                pass
             return True
         except Exception as e:
             self._continuous = False
@@ -801,19 +791,24 @@ class SPC3_Qudi(CameraInterface):
             except Exception as e:
                 self.log.error(f"Failed to stop continuous acquisition: {e}")
 
-            # After closing the file, stamp coarse gate metadata (SDK currently
-            # leaves these fields at 0 even when gating is active).
+            stem = getattr(self, "_cont_filename", "")
+            gate_mode = getattr(self, "_cont_gate_mode", None)
+            start_cyc = getattr(self, "_cont_coarse_gate_start", None)
+            stop_cyc = getattr(self, "_cont_coarse_gate_stop", None)
+
             try:
-                stem = getattr(self, "_cont_filename", "")
-                for out_path in self._list_written_spc3_paths(stem):
-                    self._patch_spc3_coarse_gate_header(
-                        out_path,
-                        gate_mode=getattr(self, "_cont_gate_mode", None),
-                        start_cycles=getattr(self, "_cont_coarse_gate_start", None),
-                        stop_cycles=getattr(self, "_cont_coarse_gate_stop", None),
-                    )
-            except Exception:
-                pass
+                out_paths = self._list_written_spc3_paths(stem)
+            except Exception as e:
+                self.log.warning(f"Could not list SPC3 files for gate-header patching: {e}")
+                out_paths = []
+
+            for out_path in out_paths:
+                self._patch_coarse_gate_verified(
+                    out_path,
+                    gate_mode=gate_mode,
+                    start_cycles=start_cyc,
+                    stop_cycles=stop_cyc,
+                )
             self._continuous = False
             self._cont_waiting_for_trigger = False
         return True
@@ -832,6 +827,13 @@ class SPC3_Qudi(CameraInterface):
                         self._cont_waiting_for_trigger = False
                 except Exception:
                     pass
+
+            # Re-patch periodically to stamp gate metadata in any new split files.
+            now = time.monotonic()
+            if now - getattr(self, "_cont_last_patch_time", 0) >= self._CONT_PATCH_INTERVAL_S:
+                self._cont_last_patch_time = now
+                self._patch_cont_files_inplace()
+
             return self._spc.ContAcqToFileGetMemory()
         return 0
 
@@ -1080,6 +1082,99 @@ class SPC3_Qudi(CameraInterface):
         except Exception as e:
             self.log.warning(f"Failed to patch coarse gate metadata in {filepath}: {e}")
             return False
+
+    def _patch_cont_files_inplace(self):
+        """Patch gate header in all current continuous-acquisition files without waiting.
+
+        Called during acquisition (at start and periodically) so the header is
+        readable before ContAcqToFileStop() is called.  Does NOT use the
+        mtime-stability wait — during acquisition the SDK is writing frame data
+        (not finalising the header), so it is safe to patch the header immediately.
+        """
+        stem = getattr(self, "_cont_filename", "")
+        if not stem:
+            return
+        try:
+            paths = self._list_written_spc3_paths(stem)
+        except Exception:
+            return
+        for p in paths:
+            self._patch_spc3_coarse_gate_header(
+                p,
+                gate_mode=getattr(self, "_cont_gate_mode", None),
+                start_cycles=getattr(self, "_cont_coarse_gate_start", None),
+                stop_cycles=getattr(self, "_cont_coarse_gate_stop", None),
+            )
+
+    def _wait_sdk_done_writing(self, filepath, timeout_s=5.0, stable_s=0.5, poll_s=0.1):
+        """Block until the file's mtime stops changing.
+
+        ContAcqToFileStop() can return before an SDK background thread finishes
+        its final header flush. Polling mtime detects when all SDK writes have
+        landed so we can safely patch afterward.
+
+        @return bool: True when stable within timeout, False on timeout/error.
+        """
+        deadline = time.monotonic() + timeout_s
+        needed = max(1, int(stable_s / poll_s))
+        last_mtime = None
+        stable_count = 0
+        mtime_changes = 0
+
+        while time.monotonic() < deadline:
+            try:
+                mtime = os.path.getmtime(filepath)
+            except Exception:
+                return False
+            if mtime == last_mtime:
+                stable_count += 1
+                if stable_count >= needed:
+                    return True
+            else:
+                mtime_changes += 1
+                last_mtime = mtime
+                stable_count = 0
+            time.sleep(poll_s)
+
+        self.log.warning(
+            f"SDK file-close wait timed out after {timeout_s:.1f}s "
+            f"({mtime_changes} mtime changes) for {os.path.basename(filepath)} — patching anyway"
+        )
+        return False
+
+    def _patch_coarse_gate_verified(self, filepath, gate_mode=None, start_cycles=None, stop_cycles=None):
+        """Wait for SDK to finish writing, then patch and verify coarse-gate header.
+
+        ContAcqToFileStop() may return before the SDK background thread has
+        written the final header (which zeros the gate fields). We wait until
+        the file's mtime is stable, then patch. A short verify-retry loop
+        guards against any last-moment SDK write that lands after stability.
+
+        @return bool: True when verified, False when gate_mode != 'coarse' or failed.
+        """
+        if gate_mode is None:
+            gate_mode = getattr(self, "_gate_mode", "off")
+        if gate_mode != "coarse":
+            return False
+
+        self._wait_sdk_done_writing(filepath)
+
+        for _ in range(self._GATE_PATCH_MAX_ATTEMPTS):
+            self._patch_spc3_coarse_gate_header(filepath, gate_mode, start_cycles, stop_cycles)
+            try:
+                with open(filepath, "rb") as f:
+                    f.seek(8 + 232)
+                    if f.read(1) == b"\x01":
+                        return True
+            except Exception:
+                pass
+            time.sleep(self._GATE_PATCH_RETRY_S)
+
+        self.log.warning(
+            f"Coarse gate metadata did not persist in {os.path.basename(filepath)} "
+            f"after {self._GATE_PATCH_MAX_ATTEMPTS} attempts"
+        )
+        return False
 
     # ── Gate control ───────────────────────────────────────────────────
 

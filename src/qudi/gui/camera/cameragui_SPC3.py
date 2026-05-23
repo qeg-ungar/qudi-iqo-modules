@@ -79,6 +79,11 @@ class CameraMainWindow(QtWidgets.QMainWindow):
         toolbar.setAllowedAreas(QtCore.Qt.AllToolBarAreas)
         self.action_start_video = QtWidgets.QAction("Start Video")
         self.action_start_video.setCheckable(True)
+        self.action_start_video.setToolTip(
+            "Start live video.\n"
+            "Blocked when nintegframes × HIT ≤ 1 000 000 clock cycles (10 ms) — "
+            "increase nintegframes in the config to enable."
+        )
         toolbar.addAction(self.action_start_video)
         self.action_capture_frame = QtWidgets.QAction("Snap")
         self.action_capture_frame.setCheckable(True)
@@ -301,6 +306,43 @@ class CameraGui(GuiBase):
             return
 
         if checked:
+            # Guard: block live mode when nintegframes × HIT ≤ 1e6 cycles (10 ms).
+            # At shorter integration times the hardware loop runs faster than the
+            # GUI can drain frames, causing the program to hang.
+            logic = self._camera_logic()
+            try:
+                exp_s = float(logic.get_exposure())
+            except Exception:
+                exp_s = None
+            if exp_s is not None and exp_s <= 0.01:
+                camera = getattr(logic, "_camera", None)
+                camera = camera() if callable(camera) else None
+                try:
+                    nintegframes = int(camera.get_binning()) if camera is not None else 1
+                    hit = getattr(camera, "_hit", None)
+                except Exception:
+                    nintegframes, hit = 1, None
+                if hit is not None:
+                    detail = (
+                        f"nintegframes = {nintegframes},  HIT = {hit} cycles\n"
+                        f"product = {nintegframes * hit:,} cycles  ({exp_s * 1e3:.2f} ms)"
+                    )
+                else:
+                    detail = f"integration time = {exp_s * 1e3:.2f} ms"
+                self._mw.action_start_video.blockSignals(True)
+                try:
+                    self._mw.action_start_video.setChecked(False)
+                finally:
+                    self._mw.action_start_video.blockSignals(False)
+                QtWidgets.QMessageBox.warning(
+                    self._mw,
+                    "Live Mode Blocked",
+                    "Integration time is too short for live mode — this would cause the program to hang.\n\n"
+                    f"{detail}\n\n"
+                    "Required:  nintegframes × HIT  >  1 000 000 clock cycles  (10 ms)\n\n"
+                    "Increase nintegframes in the config file.",
+                )
+                return
             self._mw.action_show_settings.setDisabled(True)
             self._mw.action_capture_frame.setDisabled(True)
             self._mw.action_continuous.setDisabled(True)
