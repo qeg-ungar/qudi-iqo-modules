@@ -123,7 +123,21 @@ class CameraMainWindow(QtWidgets.QMainWindow):
         toolbar.addSeparator()
         toolbar.addWidget(self.snap_frame_label)
         toolbar.addWidget(self.snap_frame_spinbox)
+
         self.addToolBar(QtCore.Qt.TopToolBarArea, toolbar)
+
+        # Mode preset selector on its own toolbar row (hidden until populated by CameraGui)
+        self.mode_toolbar = QtWidgets.QToolBar()
+        self.mode_toolbar.setAllowedAreas(QtCore.Qt.TopToolBarArea)
+        self.mode_label = QtWidgets.QLabel("Mode")
+        self.mode_combo = QtWidgets.QComboBox()
+        self.mode_combo.setMinimumWidth(120)
+        self.mode_combo.setEnabled(False)
+        self.mode_toolbar.addWidget(self.mode_label)
+        self.mode_toolbar.addWidget(self.mode_combo)
+        self.mode_toolbar.setVisible(False)
+        self.addToolBarBreak(QtCore.Qt.TopToolBarArea)
+        self.addToolBar(QtCore.Qt.TopToolBarArea, self.mode_toolbar)
 
         # Create central widget
         self.image_widget = ImageWidget()
@@ -195,6 +209,7 @@ class CameraGui(GuiBase):
         self._mw.snap_frame_spinbox.valueChanged.connect(self._snap_frame_index_changed)
         self._mw.action_continuous.triggered[bool].connect(self._continuous_clicked)
         self._mw.snap_frames_spinbox.valueChanged.connect(self._snap_frames_changed)
+        self._mw.mode_combo.currentTextChanged.connect(self._mode_changed)
 
         # connect update signals from logic
         logic.sigFrameChanged.connect(self._update_frame)
@@ -215,6 +230,7 @@ class CameraGui(GuiBase):
         # Initial state
         self._continuous_state_changed(bool(getattr(logic, "continuous_active", False)))
         self._init_snap_frames_control()
+        self._init_mode_selector()
         self.show()
 
     def on_deactivate(self):
@@ -243,6 +259,7 @@ class CameraGui(GuiBase):
         self._mw.action_continuous.triggered.disconnect()
         self._mw.snap_frame_spinbox.valueChanged.disconnect()
         self._mw.snap_frames_spinbox.valueChanged.disconnect()
+        self._mw.mode_combo.currentTextChanged.disconnect()
         self._mw.close()
 
     def show(self):
@@ -270,6 +287,7 @@ class CameraGui(GuiBase):
         self._mw.action_capture_frame.setDisabled(True)
         self._mw.action_continuous.setDisabled(True)
         self._mw.action_show_settings.setDisabled(True)
+        self._mw.mode_combo.setEnabled(False)
         self._set_snap_frames_control_enabled(False)
         self._pending_snap_save_prompt = True
         self.sigCaptureFrameTriggered.emit()
@@ -282,6 +300,7 @@ class CameraGui(GuiBase):
         self._mw.action_show_settings.setEnabled(True)
         if not self._continuous_active:
             self._mw.action_continuous.setEnabled(True)
+        self._mw.mode_combo.setEnabled(self._mw.mode_combo.count() > 0)
 
         self._set_snap_frames_control_enabled(
             self._supports_snap_frames
@@ -347,6 +366,7 @@ class CameraGui(GuiBase):
             self._mw.action_capture_frame.setDisabled(True)
             self._mw.action_continuous.setDisabled(True)
             self._mw.action_start_video.setText("Stop Video")
+            self._mw.mode_combo.setEnabled(False)
 
             self._set_snap_frames_control_enabled(False)
 
@@ -355,6 +375,7 @@ class CameraGui(GuiBase):
         else:
             self._mw.action_start_video.setText("Start Video")
             self._mw.action_continuous.setEnabled(True)
+            self._mw.mode_combo.setEnabled(self._mw.mode_combo.count() > 0)
             self._set_snap_frames_control_enabled(
                 self._supports_snap_frames
                 and (self._camera_logic().module_state() == "idle")
@@ -378,6 +399,7 @@ class CameraGui(GuiBase):
             self._mw.action_start_video.setDisabled(True)
             self._mw.action_capture_frame.setDisabled(True)
             self._mw.action_show_settings.setDisabled(True)
+            self._mw.mode_combo.setEnabled(False)
             self._set_snap_browsing_enabled(False)
             self._set_snap_frames_control_enabled(False)
         else:
@@ -386,6 +408,7 @@ class CameraGui(GuiBase):
             self._mw.action_capture_frame.setEnabled(True)
             self._mw.action_show_settings.setEnabled(True)
             self._mw.action_continuous.setEnabled(True)
+            self._mw.mode_combo.setEnabled(self._mw.mode_combo.count() > 0)
             self._set_snap_frames_control_enabled(
                 self._supports_snap_frames
                 and (self._camera_logic().module_state() == "idle")
@@ -1073,6 +1096,57 @@ class CameraGui(GuiBase):
                 self._mw,
                 "Save Error",
                 f"Failed to save averaged image.\n\n{type(e).__name__}: {e}",
+            )
+
+    def _init_mode_selector(self):
+        """Populate the mode combo from hardware presets; hide it if none are defined."""
+        logic = self._camera_logic()
+        camera = getattr(logic, "_camera", None)
+        camera = camera() if callable(camera) else None
+        get_modes = getattr(camera, "get_available_modes", None)
+        if camera is None or not callable(get_modes):
+            return
+
+        modes = get_modes()
+        if not modes:
+            return
+
+        self._mw.mode_combo.blockSignals(True)
+        try:
+            self._mw.mode_combo.clear()
+            for m in modes:
+                self._mw.mode_combo.addItem(m)
+        finally:
+            self._mw.mode_combo.blockSignals(False)
+
+        self._mw.mode_toolbar.setVisible(True)
+        self._mw.mode_combo.setEnabled(True)
+
+        # Apply the first listed mode so hardware and UI agree from the start.
+        self._mode_changed(modes[0])
+        self.log.info(f"Camera activated in mode: '{modes[0]}'.")
+
+    def _mode_changed(self, mode_name):
+        """Apply the selected hardware mode preset and refresh dependent controls."""
+        if not mode_name:
+            return
+        logic = self._camera_logic()
+        camera = getattr(logic, "_camera", None)
+        camera = camera() if callable(camera) else None
+        set_mode = getattr(camera, "set_mode", None)
+        if not callable(set_mode):
+            return
+
+        ok = bool(set_mode(mode_name))
+        if ok:
+            # Refresh snap frames spinbox and settings dialog to reflect new values.
+            self._init_snap_frames_control()
+            self._keep_former_settings()
+        else:
+            QtWidgets.QMessageBox.warning(
+                self._mw,
+                "Mode Switch Failed",
+                f"Could not apply mode '{mode_name}'.\n\nCheck the log for details.",
             )
 
     def _save_frame(self):

@@ -95,6 +95,7 @@ class SPC3_Qudi(CameraInterface):
     _cfg_gate_mode = ConfigOption("gate_mode")  # required
     _cfg_coarse_gate_start = ConfigOption("coarse_gate_start")  # required
     _cfg_coarse_gate_stop = ConfigOption("coarse_gate_stop")  # required
+    _cfg_modes = ConfigOption("modes", {})
 
     # ── Constants ──────────────────────────────────────────────────────
     _HIT_NORMAL = 1040  # Fixed HIT for Normal mode (clock cycles)
@@ -685,6 +686,76 @@ class SPC3_Qudi(CameraInterface):
         self.log.info(f"Snap frames (NFrames) set to {self._NFrames}")
         return True
 
+    # ── Mode presets ───────────────────────────────────────────────────
+
+    def get_available_modes(self):
+        """Return list of named mode presets defined in config."""
+        try:
+            return list(self._cfg_modes.keys())
+        except Exception:
+            return []
+
+    def set_mode(self, name):
+        """Apply a named mode preset from the config 'modes' dict.
+
+        Applies only the keys present in the preset, leaving all others unchanged.
+        The camera must be idle (not live/snap/continuous).
+
+        @param str name: preset name
+        @return bool: Success
+        """
+        if not isinstance(self._cfg_modes, dict) or name not in self._cfg_modes:
+            self.log.error(
+                f"Mode '{name}' not found. Available: {list(getattr(self._cfg_modes, 'keys', lambda: [])())}"
+            )
+            return False
+
+        if not self.get_ready_state():
+            self.log.error("Cannot switch mode while acquisition is active")
+            return False
+
+        preset = self._cfg_modes[name]
+
+        if "hit_cycles" in preset:
+            self._hit = max(1, min(int(preset["hit_cycles"]), 65534))
+
+        if "nintegframes" in preset:
+            self._NIntegFrames = max(1, min(int(preset["nintegframes"]), 65534))
+
+        if "nframes" in preset:
+            self._NFrames = max(1, min(int(preset["nframes"]), 65534))
+
+        if "trigger_mode" in preset:
+            valid = ("no_trigger", "single_trigger", "multiple_trigger")
+            if preset["trigger_mode"] in valid:
+                self._trigger_mode = str(preset["trigger_mode"])
+            else:
+                self.log.warning(f"Ignoring invalid trigger_mode '{preset['trigger_mode']}' in preset '{name}'")
+
+        if "trigger_frames_per_pulse" in preset:
+            self._trigger_frames_per_pulse = max(1, min(int(preset["trigger_frames_per_pulse"]), 100))
+
+        if "gate_mode" in preset:
+            gm = str(preset["gate_mode"]).strip().lower()
+            if gm in ("off", "coarse"):
+                self._gate_mode = gm
+            else:
+                self.log.warning(f"Ignoring invalid gate_mode '{preset['gate_mode']}' in preset '{name}'")
+
+        if "coarse_gate_start" in preset:
+            self._coarse_gate_start = int(preset["coarse_gate_start"])
+
+        if "coarse_gate_stop" in preset:
+            self._coarse_gate_stop = int(preset["coarse_gate_stop"])
+
+        self._apply_camera_settings()
+        self.log.info(
+            f"Mode '{name}' applied: HIT={self._hit} cycles, "
+            f"NIntegFrames={self._NIntegFrames}, NFrames={self._NFrames}, "
+            f"trigger={self._trigger_mode}, gate={self._gate_mode}"
+        )
+        return True
+
     # ── Save directory ─────────────────────────────────────────────────
 
     def get_default_save_directory(self):
@@ -750,7 +821,26 @@ class SPC3_Qudi(CameraInterface):
             self._cont_coarse_gate_start = self._coarse_gate_start
             self._cont_coarse_gate_stop = self._coarse_gate_stop
 
-            self._spc.ContAcqToFileStart(filename)
+            # ContAcqToFileStart occasionally fails with UNABLE_CREATE_FILE when
+            # the SDK background thread from the previous acquisition is still
+            # holding the file handle.  Retry up to 3 times with a brief wait.
+            _CONT_START_RETRIES = 3
+            _CONT_START_RETRY_S = 2.0
+            for _attempt in range(_CONT_START_RETRIES):
+                try:
+                    self._spc.ContAcqToFileStart(filename)
+                    break
+                except Exception as _e:
+                    if "UNABLE_CREATE_FILE" in str(_e) and _attempt < _CONT_START_RETRIES - 1:
+                        self.log.warning(
+                            f"ContAcqToFileStart failed (UNABLE_CREATE_FILE) — "
+                            f"retrying in {_CONT_START_RETRY_S:.0f}s "
+                            f"(attempt {_attempt + 1}/{_CONT_START_RETRIES - 1})"
+                        )
+                        time.sleep(_CONT_START_RETRY_S)
+                    else:
+                        raise
+
             self._continuous = True
             self._cont_filename = filename
             self._cont_last_patch_time = time.monotonic()
@@ -809,6 +899,7 @@ class SPC3_Qudi(CameraInterface):
                     start_cycles=start_cyc,
                     stop_cycles=stop_cyc,
                 )
+
             self._continuous = False
             self._cont_waiting_for_trigger = False
         return True
@@ -834,7 +925,19 @@ class SPC3_Qudi(CameraInterface):
                 self._cont_last_patch_time = now
                 self._patch_cont_files_inplace()
 
-            return self._spc.ContAcqToFileGetMemory()
+            # UNABLE_CREATE_FILE from GetMemory is typically transient: the SDK
+            # briefly returns this error while it rolls over to a new split file
+            # (~every 1 GB).  Retry a few times before surfacing the exception.
+            _GET_MEM_RETRIES = 5
+            _GET_MEM_RETRY_S = 0.2
+            for _attempt in range(_GET_MEM_RETRIES):
+                try:
+                    return self._spc.ContAcqToFileGetMemory()
+                except Exception as _e:
+                    if "UNABLE_CREATE_FILE" in str(_e) and _attempt < _GET_MEM_RETRIES - 1:
+                        time.sleep(_GET_MEM_RETRY_S)
+                    else:
+                        raise
         return 0
 
     # ── File I/O ───────────────────────────────────────────────────────

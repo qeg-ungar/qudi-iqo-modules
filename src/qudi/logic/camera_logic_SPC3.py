@@ -359,7 +359,15 @@ class CameraLogic(LogicBase):
             self._continuous_active = True
             self._continuous_filepath = outpath
             if self.__continuous_timer is not None:
-                self.__continuous_timer.start()
+                # Post start() to the timer's owning thread (the logic thread).
+                # Calling start() directly from the RPyC server thread triggers
+                # "QObject::startTimer: Timers cannot be started from another thread"
+                # and the timer silently fails to fire, so ContAcqToFileGetMemory()
+                # is never called and the camera DRAM buffer overflows.
+                QtCore.QMetaObject.invokeMethod(
+                    self.__continuous_timer, "start",
+                    QtCore.Qt.QueuedConnection,
+                )
             self.sigContinuousStateChanged.emit(True)
             return outpath
 
@@ -370,7 +378,10 @@ class CameraLogic(LogicBase):
                 return
 
             if self.__continuous_timer is not None:
-                self.__continuous_timer.stop()
+                QtCore.QMetaObject.invokeMethod(
+                    self.__continuous_timer, "stop",
+                    QtCore.Qt.QueuedConnection,
+                )
 
             camera = self._camera()
 
