@@ -334,11 +334,20 @@ class CameraLogic(LogicBase):
 
             if not filepath_stem:
                 directory = ""
-                get_dir = getattr(camera, "get_default_save_directory", None)
+                get_dir = getattr(camera, "get_continuous_save_directory", None)
+                used_getter = "get_continuous_save_directory"
+                if not callable(get_dir):
+                    get_dir = getattr(camera, "get_default_save_directory", None)
+                    used_getter = "get_default_save_directory"
                 if callable(get_dir):
                     directory = (get_dir() or "").strip()
                 if not directory:
                     directory = self.module_default_data_dir
+                    used_getter = "module_default_data_dir (fallback)"
+                self.log.info(
+                    f"Continuous acquisition save directory resolved via "
+                    f"{used_getter}: {directory}"
+                )
                 os.makedirs(directory, exist_ok=True)
                 ts = datetime.datetime.now().strftime("%Y%m%d-%H%M%S-%f")
                 filepath_stem = os.path.join(directory, f"spc3_continuous_{ts}")

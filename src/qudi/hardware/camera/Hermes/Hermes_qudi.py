@@ -68,7 +68,9 @@ class Hermes_Qudi(CameraInterface):
 
     Additional optional config keys (not required, sensible defaults apply):
             display_units: 'counts'          # 'counts' or 'cps'
-            save_directory: ''               # Pre-populated save directory in GUI
+            save_directory: ''               # Pre-populated save directory in GUI (snap acquisitions)
+            save_directory_continuous: ''     # Save directory for continuous acquisitions
+                                               # (falls back to save_directory if omitted)
 
     Unit convention
     ---------------
@@ -91,6 +93,7 @@ class Hermes_Qudi(CameraInterface):
     _cfg_trigger_mode = ConfigOption("trigger_mode")  # required
     _cfg_trigger_frames_per_pulse = ConfigOption("trigger_frames_per_pulse")  # required
     _cfg_save_directory = ConfigOption("save_directory", "")
+    _cfg_save_directory_continuous = ConfigOption("save_directory_continuous", "")
     _cfg_gate_mode = ConfigOption("gate_mode")  # required
     _cfg_coarse_gate_start = ConfigOption("coarse_gate_start")  # required
     _cfg_coarse_gate_stop = ConfigOption("coarse_gate_stop")  # required
@@ -699,8 +702,15 @@ class Hermes_Qudi(CameraInterface):
     # ── Save directory ─────────────────────────────────────────────────
 
     def get_default_save_directory(self):
-        """Return the default save directory from config, or empty string."""
+        """Return the default save directory (snap acquisitions) from config, or empty string."""
         return self._cfg_save_directory
+
+    def get_continuous_save_directory(self):
+        """Return the save directory for continuous acquisitions from config.
+
+        Falls back to the snap save directory if not separately configured.
+        """
+        return self._cfg_save_directory_continuous or self._cfg_save_directory
 
     # ── Trigger ────────────────────────────────────────────────────────
 
