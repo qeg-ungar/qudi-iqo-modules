@@ -24,7 +24,7 @@ import os
 from typing import Union, Tuple
 
 import numpy as np
-from PySide2 import QtCore, QtWidgets
+from PySide6 import QtCore, QtWidgets
 
 import qudi.util.uic as uic
 from qudi.core.configoption import ConfigOption

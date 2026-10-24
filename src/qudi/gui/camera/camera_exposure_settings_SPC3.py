@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 __all__ = ("CameraExposureDock",)
 
-from PySide2 import QtCore, QtWidgets
+from PySide6 import QtCore, QtWidgets
 from qudi.util.widgets.scientific_spinbox import ScienDSpinBox
 from qudi.util.widgets.slider import DoubleSlider
 from qudi.util.widgets.advanced_dockwidget import AdvancedDockWidget

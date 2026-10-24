@@ -26,7 +26,7 @@ import datetime
 
 import numpy as np
 
-from PySide2 import QtCore, QtWidgets, QtGui
+from PySide6 import QtCore, QtWidgets, QtGui
 
 from qudi.core.module import GuiBase
 from qudi.core.connector import Connector
@@ -47,7 +47,7 @@ class CameraMainWindow(QtWidgets.QMainWindow):
         menu_bar = QtWidgets.QMenuBar()
         menu = menu_bar.addMenu("File")
 
-        self.action_load_spc3 = QtWidgets.QAction("Load SPC3...")
+        self.action_load_spc3 = QtGui.QAction("Load SPC3...")
         try:
             path = os.path.join(get_artwork_dir(), "icons", "document-open")
             if os.path.exists(path):
@@ -57,17 +57,17 @@ class CameraMainWindow(QtWidgets.QMainWindow):
         menu.addAction(self.action_load_spc3)
 
         menu.addSeparator()
-        self.action_save_frame = QtWidgets.QAction("Save Frame")
+        self.action_save_frame = QtGui.QAction("Save Frame")
         path = os.path.join(get_artwork_dir(), "icons", "document-save")
         self.action_save_frame.setIcon(QtGui.QIcon(path))
         menu.addAction(self.action_save_frame)
         menu.addSeparator()
-        self.action_show_settings = QtWidgets.QAction("Settings")
+        self.action_show_settings = QtGui.QAction("Settings")
         path = os.path.join(get_artwork_dir(), "icons", "configure")
         self.action_show_settings.setIcon(QtGui.QIcon(path))
         menu.addAction(self.action_show_settings)
         menu.addSeparator()
-        self.action_close = QtWidgets.QAction("Close")
+        self.action_close = QtGui.QAction("Close")
         path = os.path.join(get_artwork_dir(), "icons", "application-exit")
         self.action_close.setIcon(QtGui.QIcon(path))
         self.action_close.triggered.connect(self.close)
@@ -77,7 +77,7 @@ class CameraMainWindow(QtWidgets.QMainWindow):
         # Create toolbar
         toolbar = QtWidgets.QToolBar()
         toolbar.setAllowedAreas(QtCore.Qt.AllToolBarAreas)
-        self.action_start_video = QtWidgets.QAction("Start Video")
+        self.action_start_video = QtGui.QAction("Start Video")
         self.action_start_video.setCheckable(True)
         self.action_start_video.setToolTip(
             "Start live video.\n"
@@ -85,15 +85,15 @@ class CameraMainWindow(QtWidgets.QMainWindow):
             "increase nintegframes in the config to enable."
         )
         toolbar.addAction(self.action_start_video)
-        self.action_capture_frame = QtWidgets.QAction("Snap")
+        self.action_capture_frame = QtGui.QAction("Snap")
         self.action_capture_frame.setCheckable(True)
         toolbar.addAction(self.action_capture_frame)
 
-        self.action_continuous = QtWidgets.QAction("Continuous")
+        self.action_continuous = QtGui.QAction("Continuous")
         self.action_continuous.setCheckable(True)
         toolbar.addAction(self.action_continuous)
 
-        self.action_background_subtraction = QtWidgets.QAction("Background Subtraction")
+        self.action_background_subtraction = QtGui.QAction("Background Subtraction")
         self.action_background_subtraction.setCheckable(True)
         self.action_background_subtraction.setToolTip(
             "Subtract an averaged SPC3 background image from live video frames"
@@ -199,7 +199,7 @@ class CameraGui(GuiBase):
         self._mw.action_start_video.triggered[bool].connect(self._start_video_clicked)
         self._mw.action_capture_frame.triggered.connect(self._capture_frame_clicked)
         self._mw.action_show_settings.triggered.connect(
-            lambda: self._settings_dialog.exec_()
+            lambda: self._settings_dialog.exec()
         )
         self._mw.action_save_frame.triggered.connect(self._save_frame)
         self._mw.action_load_spc3.triggered.connect(self._load_spc3_clicked)
@@ -988,7 +988,7 @@ class CameraGui(GuiBase):
         buttons.rejected.connect(dlg.reject)
         layout.addWidget(buttons)
 
-        if dlg.exec_() != QtWidgets.QDialog.Accepted:
+        if dlg.exec() != QtWidgets.QDialog.Accepted:
             return
 
         if can_save_spc3 and cb_spc3.isChecked():
